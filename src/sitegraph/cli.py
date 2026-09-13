@@ -132,6 +132,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     crawl.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "crawl without writing anything, and report how many pages each "
+            "route would have contributed — a look at the size of a site, and "
+            "at which routes are worth --per-pattern or --skip"
+        ),
+    )
+    crawl.add_argument(
         "--per-pattern",
         type=_positive,
         default=None,
@@ -207,6 +216,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 viewport=args.viewport,
                 per_pattern=args.per_pattern,
                 skip=args.skip,
+                dry_run=args.dry_run,
                 output=Path(args.output),
                 max_pages=args.max_pages,
                 resume=args.resume,

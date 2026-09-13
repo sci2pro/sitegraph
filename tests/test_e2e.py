@@ -432,6 +432,21 @@ def test_folding_is_invisible_on_a_site_without_identifiers(
     assert problems == []
 
 
+def test_a_real_dry_run_writes_nothing(site: str, tmp_path: Path) -> None:
+    """The promise, against a real browser and a real site: the same walk, and
+    not one file."""
+    from sitegraph.cli import main
+
+    output = tmp_path / "would-be"
+    assert main(["crawl", site, "--output", str(output), "--dry-run",
+                 "--max-pages", "20"]) == 0
+
+    assert not output.exists(), "a dry run created its output directory"
+    assert not list(tmp_path.glob("sitegraph-dry-run-*")), (
+        "the throwaway directory a dry run renders into was left behind"
+    )
+
+
 # --- the browser UI -----------------------------------------------------
 
 

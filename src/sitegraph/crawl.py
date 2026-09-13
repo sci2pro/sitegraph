@@ -18,8 +18,10 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import signal
 import sys
+import tempfile
 import time
 from collections import Counter, deque
 from collections.abc import Iterable
@@ -42,6 +44,7 @@ from sitegraph.store import (
     page_filename,
 )
 from sitegraph.urls import (
+    PLACEHOLDER,
     InvalidURL,
     Origin,
     SkipRules,
@@ -86,6 +89,9 @@ SCREENSHOT_QUALITY = 80
 SETTLE_TIMEOUT_MS = 3000
 
 PAGE_TIMEOUT_MS = 30_000
+
+#: Prefix for the throwaway directory a dry run renders into.
+DRY_RUN_PREFIX = "sitegraph-dry-run-"
 
 #: Raw ``href`` attributes would ignore a ``<base>`` element, so the resolved
 #: ``.href`` property is preferred. SVG anchors (which ``a[href]`` also matches)
@@ -145,7 +151,7 @@ def validate_viewport(viewport: tuple[int, int]) -> tuple[int, int]:
     return viewport
 
 
-def _first_line(exc: Exception) -> str:
+def _first_line(exc: BaseException) -> str:
     """Playwright errors are a message plus a multi-line call log; keep the message."""
     text = str(exc).strip()
     return text.splitlines()[0] if text else exc.__class__.__name__
@@ -237,6 +243,7 @@ class ChromiumRenderer:
         *,
         storage_state: Path | None = None,
         session: SharedSession | None = None,
+        capture: bool = True,
         viewport: tuple[int, int] = (VIEWPORT_WIDTH, VIEWPORT_HEIGHT),
         timeout_ms: int = PAGE_TIMEOUT_MS,
         settle_ms: int = SETTLE_TIMEOUT_MS,
@@ -254,6 +261,7 @@ class ChromiumRenderer:
         validate_viewport(viewport)
         self._storage_state = Path(storage_state) if storage_state else None
         self._session = session
+        self._capture = capture
         self._session_version = 0
         self._viewport = viewport
         self._timeout_ms = timeout_ms
@@ -363,12 +371,13 @@ class ChromiumRenderer:
             # Taken last and guarded separately: the page is already fully
             # described by this point, so a capture that fails should cost the
             # thumbnail and nothing else.
-            try:
-                page.screenshot(
-                    path=screenshot_path, type="webp", quality=SCREENSHOT_QUALITY
-                )
-            except PlaywrightError:
-                screenshot_path.unlink(missing_ok=True)
+            if self._capture:
+                try:
+                    page.screenshot(
+                        path=screenshot_path, type="webp", quality=SCREENSHOT_QUALITY
+                    )
+                except PlaywrightError:
+                    screenshot_path.unlink(missing_ok=True)
 
             return PageResult(status=status, title=title, hrefs=hrefs)
         finally:
@@ -726,6 +735,7 @@ def crawl(
     viewport: tuple[int, int] | None = None,
     per_pattern: int | None = None,
     skip: Iterable[str] | None = None,
+    dry_run: bool = False,
     storage_state: Path | None = None,
     renderer: Renderer | None = None,
     renderer_factory=None,
@@ -809,10 +819,23 @@ def crawl(
         if renderer_factory is not None:
             return renderer_factory()
         return ChromiumRenderer(
-            storage_state=storage_state, session=session, viewport=size
+            storage_state=storage_state,
+            session=session,
+            capture=not dry_run,
+            viewport=size,
         )
 
-    store = CrawlStore(output)
+    # Where the render workers put their captures. A dry run writes nothing
+    # into --output, so it gets a throwaway directory instead: `Renderer.visit`
+    # promises a path it can write a capture to, and handing it one under a
+    # directory nobody created would break that promise for every renderer
+    # except `ChromiumRenderer`, which skips the capture entirely.
+    scratch = Path(tempfile.mkdtemp(prefix=DRY_RUN_PREFIX)) if dry_run else None
+    store = CrawlStore(scratch if scratch is not None else output)
+
+    def discard_scratch() -> None:
+        if scratch is not None:
+            shutil.rmtree(scratch, ignore_errors=True)
     previously = 0
 
     if resume:
@@ -867,7 +890,7 @@ def crawl(
         print(f"Rendering {live} pages at a time{note}.")
 
     store.create()
-    if not resume:
+    if not resume and not dry_run:
         # Written before the first page is visited, so an immediate Ctrl-C
         # still leaves a valid (if empty) dataset rather than no graph.json at
         # all. It is deliberately empty rather than holding a placeholder root:
@@ -903,6 +926,7 @@ def crawl(
             root_url=root_url,
             queued=queued,
             queue=queue,
+            publish=not dry_run,
         )
         committed += 1
         print(
@@ -933,8 +957,14 @@ def crawl(
     def finish(reason: str, code: int) -> None:
         _ignore_further_interrupts()
         wedged = teardown()
-        store.write_graph(graph)
+        if not dry_run:
+            store.write_graph(graph)
         print()
+        if dry_run:
+            _dry_run_report(graph, committed, queue, started, len(in_flight), passed_over, skipped)
+            print(reason)
+            discard_scratch()
+            raise SystemExit(code)
         _report(
             graph,
             output,
@@ -1024,6 +1054,11 @@ def crawl(
     # The workers are idle at this point (nothing is in flight), but they are
     # still holding browsers open until they are told to stop.
     teardown()
+    if dry_run:
+        _dry_run_report(graph, committed, queue, started, 0, passed_over, skipped)
+        print("\nRun it again without --dry-run to write the results.")
+        discard_scratch()
+        return
     _report(
         graph, output, committed, queue, started, passed_over=passed_over, skipped=skipped
     )
@@ -1040,6 +1075,7 @@ def _commit(
     root_url: str,
     queued: set[str],
     queue: deque[tuple[str, int]],
+    publish: bool = True,
 ) -> None:
     """Publish one rendered page: screenshot, record, graph, and its new links.
 
@@ -1047,6 +1083,10 @@ def _commit(
     because IDs are positional and only committed pages may hold one. That is
     what lets a worker capture a page before its number exists: the picture
     waits in the scratch directory until this rename gives it a name.
+
+    ``publish=False`` is the dry run: the graph is built exactly as it would
+    have been — the walk, the links and the volume report all depend on it —
+    but none of it reaches the disk.
     """
     node = graph.add_page(job.url, depth=job.depth, root=job.url == root_url)
     links = internal_links(job.url, result.hrefs, origin)
@@ -1055,7 +1095,7 @@ def _commit(
     # from `failed` rather than a broken image. A page that rendered but whose
     # capture never landed gets `None` too, which is honest about the same way.
     screenshot = None
-    if not result.failed and store.adopt_screenshot(job.scratch, node.id):
+    if publish and not result.failed and store.adopt_screenshot(job.scratch, node.id):
         screenshot = store.screenshot_rel(node.id)
 
     graph.add_page(
@@ -1074,7 +1114,8 @@ def _commit(
             queued.add(target)
             queue.append((target, job.depth + 1))
 
-    _persist(store, graph, node.id)
+    if publish:
+        _persist(store, graph, node.id)
 
 
 def _persist(store: CrawlStore, graph: Graph, node_id: str) -> None:
@@ -1088,6 +1129,138 @@ def _persist(store: CrawlStore, graph: Graph, node_id: str) -> None:
     if node is not None:
         store.write_page(graph.page_dict(node))
     store.write_graph(graph)
+
+
+#: A route is worth mentioning in a dry run from this many pages up. One page
+#: is not a finding.
+VOLUME_FLOOR = 2
+
+#: ...and worth naming a way to leave alone when it is both this much of the
+#: crawl *and* this many pages. The share alone would suggest leaving out a
+#: two-page route on a four-page site, which is noise; the count alone would
+#: miss a route that is small here and enormous on the site next door.
+VOLUME_SUGGEST_SHARE = 0.10
+VOLUME_SUGGEST_PAGES = 5
+
+#: How many routes the report will list.
+VOLUME_SHOWN = 10
+
+
+def _skip_hint(shape: str) -> str | None:
+    """The literal ``--skip`` that would leave *shape* alone, if there is one.
+
+    Everything up to the first identifier: ``/courses/:id`` gives ``/courses``.
+    A shape parameterised from its very first segment (``/:id``) has no shorter
+    prefix than the whole site, so it gets no suggestion rather than advice to
+    skip everything.
+    """
+    kept: list[str] = []
+    for segment in urlsplit(shape).path.split("/"):
+        if segment == PLACEHOLDER:
+            break
+        kept.append(segment)
+    prefix = "/".join(kept)
+    return prefix if len(prefix) > 1 else None
+
+
+def _dry_run_report(
+    graph: Graph,
+    visited: int,
+    queue: deque[tuple[str, int]],
+    started: float,
+    abandoned: int,
+    passed_over: int,
+    skipped: int,
+) -> None:
+    """Say what a crawl would have produced, and what looks expensive.
+
+    The point is to answer "is this site a hundred pages or ten thousand, and
+    if it is ten thousand, which route is eating them" *before* spending the
+    time and the disk. That is a question about volume, so the answer is a
+    table of routes by page count rather than a graph.
+    """
+    elapsed = time.monotonic() - started
+    print("\nDry run — nothing was written.")
+    print(
+        f"Would capture {visited} page(s) in {elapsed:.1f}s — "
+        f"{len(graph)} discovered, {len(graph.edges())} edge(s)."
+    )
+
+    total = len(graph.nodes)
+    routes = Counter(node.shape for node in graph.nodes)
+    bulk = [
+        (shape, count)
+        for shape, count in routes.most_common(VOLUME_SHOWN)
+        if count >= VOLUME_FLOOR
+    ]
+    if not bulk:
+        print("\nNo route has more than one page; there is no bulk to leave out.")
+    else:
+        print(f"\n  {'pages':>5}  {'share':>5}  route")
+        for shape, count in bulk:
+            print(f"  {count:>5}  {100 * count / total:>4.0f}%  {_display(shape)}")
+
+        shape, count = bulk[0]
+        if count >= VOLUME_SUGGEST_PAGES and count >= VOLUME_SUGGEST_SHARE * total:
+            # Only the biggest, and only when it actually dominates: a tool
+            # that suggests leaving something out on every crawl is a tool
+            # whose suggestions get ignored.
+            print(f"\n{_display(shape)} alone is {count} of the {total} pages found.")
+            print(
+                f"  --per-pattern 1       capture one page of each route, not {count}"
+            )
+            hint = _skip_hint(shape)
+            if hint:
+                print(f"  --skip {hint:<14} leave the route out of the crawl")
+
+    _caveats(graph, queue, abandoned, passed_over, skipped)
+
+
+def _caveats(
+    graph: Graph,
+    queue: deque[tuple[str, int]],
+    abandoned: int,
+    passed_over: int,
+    skipped: int,
+) -> None:
+    """The pages a run did not capture, each for its own reason.
+
+    Shared by the ordinary summary and the dry run, because the reasons are
+    the same either way and a number without its reason reads as a failure.
+    """
+    failed = {node.url for node in graph.nodes if node.failed}
+    if failed:
+        print(f"{len(failed)} page(s) failed to render (kept in the graph).")
+
+    remaining = len(queue) + abandoned
+    if remaining:
+        retrying = sum(1 for url, _ in queue if url in failed)
+        print(
+            f"{remaining} page(s) still to capture — run the same command "
+            f"with --resume to continue."
+        )
+        if retrying:
+            print(
+                f"  ({retrying} of them failed to render and will be retried, "
+                f"so this count will not reach zero while they keep failing.)"
+            )
+    elif failed:
+        print(
+            f"Nothing is waiting; --resume retries the "
+            f"{len(failed)} failed page(s)."
+        )
+
+    if skipped:
+        print(
+            f"{skipped} page(s) skipped by --skip; they remain visible as "
+            f"uncaptured links."
+        )
+
+    if passed_over:
+        print(
+            f"{passed_over} further page(s) of a route already seen were left "
+            f"uncaptured (--per-pattern); raise it and --resume to take them."
+        )
 
 
 def _report(
@@ -1116,43 +1289,4 @@ def _report(
         f"\nCaptured {visited} page(s) in {elapsed:.1f}s — "
         f"{len(graph)} in total, {len(graph.edges())} edge(s) → {output}"
     )
-
-    failed = {node.url for node in graph.nodes if node.failed}
-    if failed:
-        print(f"{len(failed)} page(s) failed to render (kept in the graph).")
-
-    remaining = len(queue) + abandoned
-    if remaining:
-        retrying = sum(1 for url, _ in queue if url in failed)
-        print(
-            f"{remaining} page(s) still to capture — run the same command "
-            f"with --resume to continue."
-        )
-        if retrying:
-            print(
-                f"  ({retrying} of them failed to render and will be retried, "
-                f"so this count will not reach zero while they keep failing.)"
-            )
-    elif failed:
-        # Nothing is queued, but a resume is still not a no-op: failed pages are
-        # put back in the frontier each time, so saying nothing here would make
-        # the next run look like it had invented work.
-        print(
-            f"Nothing is waiting; --resume retries the "
-            f"{len(failed)} failed page(s)."
-        )
-
-    if skipped:
-        print(
-            f"{skipped} page(s) skipped by --skip; they remain visible as "
-            f"uncaptured links."
-        )
-
-    if passed_over:
-        # Not "waiting": these were dropped from the frontier on purpose, and
-        # only a larger cap brings them back. Say which knob, or the count looks
-        # like something the crawler failed to do.
-        print(
-            f"{passed_over} further page(s) of a route already seen were left "
-            f"uncaptured (--per-pattern); raise it and --resume to take them."
-        )
+    _caveats(graph, queue, abandoned, passed_over, skipped)

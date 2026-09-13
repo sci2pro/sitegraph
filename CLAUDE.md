@@ -35,10 +35,55 @@ uv run sitegraph crawl http://localhost:3000 --workers 8     # render more at on
 uv run sitegraph crawl http://localhost:3000 --viewport 390x844   # capture a phone layout
 uv run sitegraph crawl http://localhost:3000 --per-pattern 1   # one page per route
 uv run sitegraph crawl http://localhost:3000 --skip /admin    # leave a path alone
+uv run sitegraph crawl http://localhost:3000 --dry-run       # look before writing
 uv run sitegraph crawl http://localhost:3000 --resume        # carry on a capped crawl
 uv run sitegraph login http://localhost:3000/login           # only for signed-in crawls
 uv run sitegraph serve
 ```
+
+## Looking before writing
+
+```bash
+uv run sitegraph crawl localhost:3000 --dry-run
+```
+
+A dry run walks the site exactly as a real crawl would — same renderer, same
+frontier, same links — and writes nothing at all, not even the output
+directory. Then it says what it found, by route:
+
+```
+Dry run — nothing was written.
+Would capture 612 page(s) in 41.3s — 612 discovered, 1204 edge(s).
+
+  pages  share  route
+    480    78%  /courses/:id
+    132    22%  /search?q=:id
+
+/courses/:id alone is 480 of the 612 pages found.
+  --per-pattern 1       capture one page of each route, not 480
+  --skip /courses       leave the route out of the crawl
+```
+
+The point is to answer "is this a hundred pages or ten thousand, and if it is
+ten thousand, which route is eating them" before spending the time and the
+disk. Two things follow from that:
+
+- **The workers render into a throwaway directory** (`tempfile.mkdtemp`), not
+  into `--output`. `Renderer.visit` promises a path it can write a capture to,
+  so handing it one under a directory nobody created would break that promise
+  for every renderer except `ChromiumRenderer`, which skips the capture
+  entirely when told to. The directory is removed on the way out, including
+  after an interrupt.
+- **Both levers are named, and neither is chosen.** The report says the route is
+  large; whether that is bulk to skip or content to keep is the user's call, and
+  a tool that decides for them gets it wrong on the site where it matters.
+
+A suggestion needs the route to clear **both** thresholds — at least 5 pages
+*and* at least a tenth of the crawl. The share alone would suggest leaving out a
+two-page route on a four-page site; the count alone would miss a route that is
+small here and enormous next door. A route parameterised from its first segment
+(`/:id`) gets no `--skip` suggestion, because its shortest prefix is the whole
+site — advice to skip everything is not advice.
 
 ## Leaving paths alone
 

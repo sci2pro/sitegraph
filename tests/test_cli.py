@@ -144,6 +144,18 @@ def test_crawl_rejects_an_unusable_skip_pattern(value: str) -> None:
         build_parser().parse_args(["crawl", "http://x/", "--skip", value])
 
 
+def test_crawl_is_not_a_dry_run_by_default() -> None:
+    args = build_parser().parse_args(["crawl", "http://localhost:3000"])
+
+    assert args.dry_run is False
+
+
+def test_crawl_accepts_a_dry_run() -> None:
+    args = build_parser().parse_args(["crawl", "http://x/", "--dry-run"])
+
+    assert args.dry_run is True
+
+
 def test_crawl_captures_every_instance_by_default() -> None:
     args = build_parser().parse_args(["crawl", "http://localhost:3000"])
 

@@ -933,6 +933,121 @@ def test_skipping_nothing_is_the_same_as_not_asking(tmp_path: Path) -> None:
     assert set(nodes_by_url(with_skip)) == set(nodes_by_url(without))
 
 
+# --- looking before writing ---------------------------------------------
+
+
+def bulk_site(rows: int = 8) -> dict[str, PageResult]:
+    pages = {ROOT: result(*[f"/courses/{n}" for n in range(rows)], "/about")}
+    for number in range(rows):
+        pages[f"http://example.com/courses/{number}"] = result("/")
+    pages["http://example.com/about"] = result()
+    return pages
+
+
+def test_a_dry_run_writes_nothing_at_all(tmp_path: Path) -> None:
+    output = tmp_path / "never-created"
+    crawl(ROOT, output, 100, dry_run=True, renderer=FakeRenderer(bulk_site()))
+
+    assert not output.exists(), "a dry run must not even create the directory"
+
+
+def test_a_dry_run_still_walks_the_whole_site(tmp_path: Path) -> None:
+    """The report is only worth reading if it looked at the same pages a real
+    crawl would have."""
+    renderer = FakeRenderer(bulk_site())
+    crawl(ROOT, tmp_path / "out", 100, dry_run=True, renderer=renderer)
+
+    assert len(renderer.visited) == 10
+    assert renderer.visited[0] == ROOT
+
+
+def test_a_dry_run_reports_what_each_route_would_cost(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    crawl(ROOT, tmp_path / "out", 100, dry_run=True, renderer=FakeRenderer(bulk_site()))
+
+    out = capsys.readouterr().out
+    assert "Dry run — nothing was written." in out
+    assert "Would capture 10 page(s)" in out
+    assert "/courses/:id" in out
+    assert "8" in out and "80%" in out
+
+
+def test_a_dry_run_suggests_both_ways_to_leave_a_route_alone(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """--per-pattern keeps one page of the route; --skip drops it. Which is
+    right is the user's call, so the report does not make it."""
+    crawl(ROOT, tmp_path / "out", 100, dry_run=True, renderer=FakeRenderer(bulk_site()))
+
+    out = capsys.readouterr().out
+    assert "--per-pattern 1" in out
+    assert "--skip /courses" in out
+
+
+def test_a_dry_run_says_nothing_to_skip_when_nothing_dominates(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """A report that finds something to skip on every crawl is a report whose
+    suggestions get ignored."""
+    pages = {ROOT: result("/about", "/courses/1", "/courses/2")}
+    for url in ("http://example.com/about", "http://example.com/courses/1",
+                "http://example.com/courses/2"):
+        pages[url] = result()
+    crawl(ROOT, tmp_path / "out", 100, dry_run=True, renderer=FakeRenderer(pages))
+
+    out = capsys.readouterr().out
+    assert "/courses/:id" in out, "two pages is still worth listing"
+    assert "--per-pattern 1" not in out, (
+        "but two pages is not a bulk problem, whatever share of a small crawl "
+        "they happen to be"
+    )
+
+
+def test_a_dry_run_never_suggests_skipping_the_whole_site(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """A route parameterised from the first segment has no shorter prefix than
+    everything, and suggesting `--skip /` would be advice to skip the site."""
+    pages = {ROOT: result(*[f"/{n}" for n in range(1, 7)])}
+    for number in range(1, 7):
+        pages[f"http://example.com/{number}"] = result("/")
+    crawl(ROOT, tmp_path / "out", 100, dry_run=True, renderer=FakeRenderer(pages))
+
+    out = capsys.readouterr().out
+    assert "/:id" in out
+    assert "--per-pattern 1" in out, "the route still dominates"
+    assert "--skip" not in out, "and there is no prefix worth suggesting"
+    assert not (tmp_path / "out").exists()
+
+
+def test_a_dry_run_reports_the_same_caps_a_real_one_would_apply(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """The two flags compose: preview what --per-pattern would leave you."""
+    crawl(
+        ROOT,
+        tmp_path / "out",
+        100,
+        dry_run=True,
+        per_pattern=2,
+        renderer=FakeRenderer(bulk_site()),
+    )
+
+    out = capsys.readouterr().out
+    assert "Would capture 4 page(s)" in out
+    assert "6 further page(s) of a route already seen" in out
+
+
+def test_a_dry_run_leaves_no_scratch_directory_behind(tmp_path: Path) -> None:
+    """The scratch directory is created by `create`, which a dry run skips —
+    otherwise sweeping it would recreate the directory it just avoided."""
+    output = tmp_path / "out"
+    crawl(ROOT, output, 100, dry_run=True, renderer=FakeRenderer(bulk_site()))
+
+    assert not (output / SCREENSHOTS_DIR).exists()
+
+
 # --- input validation ---------------------------------------------------
 
 
