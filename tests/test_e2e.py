@@ -477,6 +477,91 @@ def test_ui_explains_an_unusable_graph(
                 browser.close()
 
 
+# --- resume, end to end -------------------------------------------------
+
+
+def test_resuming_a_capped_crawl_finishes_it(
+    site: str, tmp_path: Path, graph: dict
+) -> None:
+    """The user-facing promise: a crawl cut short by --max-pages can be picked
+    up again, in the same directory, without re-capturing anything."""
+    output = tmp_path / "resumed"
+
+    crawl(site, output, 3)
+    partial = json.loads((output / GRAPH_FILE).read_text())
+    assert len(partial["nodes"]) == 3
+    assert len(partial["nodes"]) < len(graph["nodes"])
+
+    # Three pages a run, the same command each time, until it runs dry.
+    for _ in range(10):
+        crawl(site, output, 3, resume=True)
+        if len(json.loads((output / GRAPH_FILE).read_text())["nodes"]) >= len(
+            graph["nodes"]
+        ):
+            break
+
+    finished = json.loads((output / GRAPH_FILE).read_text())
+    assert [node["url"] for node in finished["nodes"]] == [
+        node["url"] for node in graph["nodes"]
+    ]
+    assert [node["id"] for node in finished["nodes"]] == [
+        node["id"] for node in graph["nodes"]
+    ]
+    assert finished["edges"] == graph["edges"]
+
+
+def test_resume_does_not_recapture_screenshots(site: str, tmp_path: Path) -> None:
+    output = tmp_path / "kept"
+    crawl(site, output, 3)
+
+    kept = sorted(p.name for p in (output / SCREENSHOTS_DIR).glob("*.webp"))
+    stamps = {
+        path.name: path.stat().st_mtime_ns
+        for path in (output / SCREENSHOTS_DIR).glob("*.webp")
+    }
+
+    crawl(site, output, 3, resume=True)
+
+    after = {
+        path.name: path.stat().st_mtime_ns
+        for path in (output / SCREENSHOTS_DIR).glob("*.webp")
+    }
+    for name in kept:
+        assert after[name] == stamps[name], f"{name} was captured twice"
+    assert len(after) > len(kept), "the second run captured new pages"
+
+
+def test_cli_resume_round_trip(tmp_path: Path, site: str) -> None:
+    """The two commands a user actually types."""
+    from sitegraph.cli import main
+
+    output = tmp_path / ".sitegraph"
+    assert main(["crawl", site, "--output", str(output), "--max-pages", "2"]) == 0
+    first = json.loads((output / GRAPH_FILE).read_text())
+    assert len(first["nodes"]) == 2
+
+    assert (
+        main(
+            [
+                "crawl",
+                site,
+                "--output",
+                str(output),
+                "--max-pages",
+                "2",
+                "--resume",
+            ]
+        )
+        == 0
+    )
+
+    second = json.loads((output / GRAPH_FILE).read_text())
+    assert len(second["nodes"]) == 4
+    assert [node["id"] for node in second["nodes"][:2]] == [
+        node["id"] for node in first["nodes"]
+    ]
+
+
 # --- the CLI, end to end ------------------------------------------------
 
 

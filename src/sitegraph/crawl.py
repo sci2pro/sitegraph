@@ -16,6 +16,7 @@ Everything is written as it is discovered, so a crawl stopped by Ctrl-C or by
 
 from __future__ import annotations
 
+import json
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -27,10 +28,24 @@ from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import sync_playwright
 
 from sitegraph.graph import Graph
-from sitegraph.store import CrawlStore
-from sitegraph.urls import internal_links, normalize_url, origin_of
+from sitegraph.store import (
+    PAGES_DIR,
+    CrawlNotFound,
+    CrawlStore,
+    load_graph,
+    page_filename,
+)
+from sitegraph.urls import InvalidURL, internal_links, normalize_url, origin_of
 
-__all__ = ["ChromiumRenderer", "PageResult", "Renderer", "crawl"]
+__all__ = [
+    "ChromiumRenderer",
+    "PageResult",
+    "Renderer",
+    "ResumeError",
+    "ResumeState",
+    "crawl",
+    "resume_state",
+]
 
 #: Spec §7: viewport screenshots at 1440x900.
 VIEWPORT_WIDTH = 1440
@@ -104,10 +119,20 @@ class ChromiumRenderer:
     def __init__(
         self,
         *,
+        storage_state: Path | None = None,
         viewport: tuple[int, int] = (VIEWPORT_WIDTH, VIEWPORT_HEIGHT),
         timeout_ms: int = PAGE_TIMEOUT_MS,
         settle_ms: int = SETTLE_TIMEOUT_MS,
     ) -> None:
+        if storage_state is not None and not Path(storage_state).is_file():
+            # Checked here rather than left to Playwright, which opens the file
+            # lazily and raises a bare FileNotFoundError from inside its own
+            # driver — after the browser has already launched.
+            raise FileNotFoundError(
+                f"no session file at {storage_state} "
+                f"(create one with `sitegraph login`)"
+            )
+        self._storage_state = Path(storage_state) if storage_state else None
         self._viewport = viewport
         self._timeout_ms = timeout_ms
         self._settle_ms = settle_ms
@@ -117,11 +142,27 @@ class ChromiumRenderer:
 
     def __enter__(self) -> Self:
         self._playwright = sync_playwright().start()
-        self._browser = self._playwright.chromium.launch()
-        self._context = self._browser.new_context(
-            viewport={"width": self._viewport[0], "height": self._viewport[1]},
-        )
-        self._context.set_default_timeout(self._timeout_ms)
+        try:
+            self._browser = self._playwright.chromium.launch()
+            self._context = self._browser.new_context(
+                viewport={"width": self._viewport[0], "height": self._viewport[1]},
+                # A session saved by `sitegraph login`: cookies and
+                # localStorage, replayed into the context so the crawl sees
+                # what a signed-in person would. Playwright wants None rather
+                # than a missing path.
+                storage_state=(
+                    str(self._storage_state) if self._storage_state else None
+                ),
+            )
+            self._context.set_default_timeout(self._timeout_ms)
+        except BaseException:
+            # `__exit__` is not called when `__enter__` raises, so whatever was
+            # started above has to be torn down here. Skipping it leaks the
+            # driver, and a leaked driver leaves a running event loop behind
+            # that makes every later crawl in the same process fail with a
+            # bewildering "Playwright Sync API inside the asyncio loop".
+            self.__exit__(None, None, None)
+            raise
         return self
 
     def __exit__(self, *exc_info: object) -> None:
@@ -192,38 +233,190 @@ def _display(url: str) -> str:
     return parts.path + (f"?{parts.query}" if parts.query else "")
 
 
+class ResumeError(Exception):
+    """Raised when there is no crawl to continue, or it is not this crawl."""
+
+
+@dataclass(slots=True)
+class ResumeState:
+    """A crawl read back from disk, ready to be carried on.
+
+    ``queue`` holds the pages that were discovered but never captured, in
+    shallowest-first order so that continuing approximates the breadth-first
+    walk a single run would have made.
+    """
+
+    graph: Graph
+    queue: deque[tuple[str, int]]
+    #: The start URL of the *stored* crawl, or ``None`` if nothing was captured.
+    root_url: str | None
+
+    @property
+    def captured(self) -> int:
+        return len(self.graph)
+
+
+def resume_state(directory: Path) -> ResumeState:
+    """Rebuild the graph and the pending queue from a previous crawl.
+
+    The frontier is *reconstructed*, not stored: every page record already
+    lists the links it contained, so the pages that were discovered but not
+    reached are exactly the ones named in some record that have no record of
+    their own. That means there is no second file to keep in sync with
+    ``graph.json``, and resuming works the same whether the previous run
+    stopped at ``--max-pages``, met Ctrl-C, or died outright.
+    """
+    directory = Path(directory)
+    try:
+        payload = load_graph(directory)
+    except CrawlNotFound as exc:
+        raise ResumeError(f"{exc} — nothing to resume") from None
+
+    graph = Graph()
+    root_id = payload.get("root")
+
+    for stored in payload.get("nodes") or []:
+        try:
+            node = graph.add_page(
+                stored["url"],
+                title=stored.get("title") or "",
+                depth=stored.get("depth") or 0,
+                status=stored.get("status"),
+                screenshot=stored.get("screenshot"),
+                failed=bool(stored.get("failed")),
+                root=stored.get("id") == root_id,
+            )
+        except (KeyError, InvalidURL) as exc:
+            raise ResumeError(
+                f"{directory / 'graph.json'} is not a usable crawl: {exc}"
+            ) from None
+        if node.id != stored.get("id"):
+            # IDs are positional, so a graph.json that is missing a node or has
+            # one out of order would silently renumber every reference in it.
+            raise ResumeError(
+                f"{directory / 'graph.json'} is not a usable crawl: expected "
+                f"node {stored.get('id')!r} but rebuilt it as {node.id!r}"
+            )
+
+    _restore_links(graph, directory)
+
+    captured = {node.url for node in graph.nodes}
+    pending: dict[str, int] = {}
+    for node in graph.nodes:
+        for link in node.links:
+            if link in captured or link in pending:
+                continue
+            pending[link] = node.depth + 1
+
+    # A page that failed to render was never really captured, so it goes back
+    # in the queue to be tried again rather than staying blank forever.
+    for node in graph.nodes:
+        if node.failed:
+            pending[node.url] = node.depth
+
+    queue: deque[tuple[str, int]] = deque(
+        sorted(pending.items(), key=lambda item: item[1])
+    )
+    root = graph.get(root_id) if root_id else None
+    return ResumeState(graph=graph, queue=queue, root_url=root.url if root else None)
+
+
+def _restore_links(graph: Graph, directory: Path) -> None:
+    """Put each node's ``links`` back from its page record.
+
+    The graph alone cannot say which pages were *discovered*; that lives in the
+    per-page records, which is the whole reason they are kept separate.
+    """
+    for node in graph.nodes:
+        path = directory / PAGES_DIR / page_filename(node.id)
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            print(f"warning: {path.name} is missing or unreadable; skipping its links")
+            continue
+        node.links = [link for link in record.get("links") or [] if isinstance(link, str)]
+
+
 def crawl(
     url: str,
     output: Path,
     max_pages: int,
     *,
+    resume: bool = False,
+    storage_state: Path | None = None,
     renderer: Renderer | None = None,
 ) -> None:
     """Crawl *url*, writing graph.json, pages/, and screenshots/ under *output*.
 
     Stays within the origin of *url*. Results are persisted incrementally so an
     interrupted crawl still leaves usable data behind.
+
+    *max_pages* caps the pages captured **in this run**. With *resume* that
+    makes the cap a budget rather than a dead end: the same command run again
+    picks up the pages the last run discovered but never reached, so a site
+    larger than the cap can be walked in as many passes as it takes.
+
+    *storage_state* is a session saved by `sitegraph login`, used to reach
+    pages that require a sign-in. It is ignored when a *renderer* is supplied —
+    an injected renderer brings its own browser.
     """
     root_url = normalize_url(url)
     origin = origin_of(root_url)
 
     store = CrawlStore(output)
-    store.create()
+    previously = 0
 
-    graph = Graph()
-    # Written before the first page is visited, so an immediate Ctrl-C still
-    # leaves a valid (if empty) dataset rather than no graph.json at all. It is
-    # deliberately empty rather than holding a placeholder root: every node in
-    # graph.json has a page record beside it, at every moment the file exists.
-    store.write_graph(graph)
+    if resume:
+        state = resume_state(output)
+        if state.root_url is not None and state.root_url != root_url:
+            raise ResumeError(
+                f"{output} holds a crawl of {state.root_url}, not {root_url}\n"
+                f"       use --output to point at a different directory, or "
+                f"drop --resume to start a fresh crawl."
+            )
+        graph = state.graph
+        queue = state.queue
+        previously = state.captured
+        if not graph.nodes:  # interrupted before the first page was written
+            queue = deque([(root_url, 0)])
+    else:
+        graph = Graph()
+        queue = deque([(root_url, 0)])
 
-    started = time.monotonic()
-    queue: deque[tuple[str, int]] = deque([(root_url, 0)])
-    queued: set[str] = {root_url}
+    queued: set[str] = {url for url, _ in queue} | {node.url for node in graph.nodes}
     visited = 0
-    failures = 0
 
-    with (renderer or ChromiumRenderer()) as browser:
+    if not queue:
+        print(
+            f"Nothing left to crawl: all {previously} captured page(s) are "
+            f"already accounted for."
+        )
+        return
+
+    if resume:
+        print(
+            f"Resuming {root_url} — {previously} page(s) captured, "
+            f"{len(queue)} discovered but not yet visited."
+        )
+
+    # The renderer starts before anything is written: a browser that cannot
+    # launch — or a --storage-state path that does not exist — should fail
+    # without leaving a half-made output directory behind.
+    with (renderer or ChromiumRenderer(storage_state=storage_state)) as browser:
+        store.create()
+        if not resume:
+            # Written before the first page is visited, so an immediate Ctrl-C
+            # still leaves a valid (if empty) dataset rather than no graph.json
+            # at all. It is deliberately empty rather than holding a placeholder
+            # root: every node in graph.json has a page record beside it, at
+            # every moment the file exists.
+            store.write_graph(graph)
+
+        # A resumed run counts on from where the last one stopped, so the
+        # numbers keep climbing across passes instead of restarting at one.
+        ceiling = previously + max_pages
+
+        started = time.monotonic()
         try:
             while queue and visited < max_pages:
                 page_url, depth = queue.popleft()
@@ -238,8 +431,6 @@ def crawl(
                 visited += 1
 
                 links = internal_links(page_url, result.hrefs, origin)
-                if result.failed:
-                    failures += 1
 
                 graph.add_page(
                     page_url,
@@ -260,7 +451,7 @@ def crawl(
                         queue.append((target, depth + 1))
 
                 print(
-                    f"[{visited:>4}/{max_pages}] "
+                    f"[{previously + visited:>4}/{ceiling}] "
                     f"{result.status or 'ERR':>4}  "
                     f"{_display(page_url)}"
                     + (f"  ({result.title})" if result.title else "")
@@ -269,13 +460,11 @@ def crawl(
                 _persist(store, graph, node.id)
         except KeyboardInterrupt:
             print()
-            _report(graph, output, visited, len(queue), started)
-            print("Interrupted — partial results are still usable.")
+            _report(graph, output, visited, queue, started)
+            print("Interrupted — continue with --resume.")
             raise SystemExit(130) from None
 
-    _report(graph, output, visited, len(queue), started)
-    if failures:
-        print(f"{failures} page(s) failed to render (kept in the graph).")
+    _report(graph, output, visited, queue, started)
     print(f"\nExplore with:  sitegraph serve --dir {output}")
 
 
@@ -293,13 +482,45 @@ def _persist(store: CrawlStore, graph: Graph, node_id: str) -> None:
 
 
 def _report(
-    graph: Graph, output: Path, visited: int, remaining: int, started: float
+    graph: Graph,
+    output: Path,
+    visited: int,
+    queue: deque[tuple[str, int]],
+    started: float,
 ) -> None:
-    """Print the end-of-crawl summary."""
+    """Print the end-of-crawl summary.
+
+    *queue* is what is left over, which is not the same as "pages nobody has
+    looked at": a page that failed to render is put back in the queue, so the
+    count can hold steady across resumes. Saying so beats letting a user watch
+    a number refuse to fall and wonder what is wrong.
+    """
     elapsed = time.monotonic() - started
     print(
-        f"\nCrawled {visited} page(s) in {elapsed:.1f}s — "
-        f"{len(graph)} node(s), {len(graph.edges())} edge(s) → {output}"
+        f"\nCaptured {visited} page(s) in {elapsed:.1f}s — "
+        f"{len(graph)} in total, {len(graph.edges())} edge(s) → {output}"
     )
-    if remaining:
-        print(f"{remaining} page(s) discovered but not visited (--max-pages).")
+
+    failed = {node.url for node in graph.nodes if node.failed}
+    if failed:
+        print(f"{len(failed)} page(s) failed to render (kept in the graph).")
+
+    if queue:
+        retrying = sum(1 for url, _ in queue if url in failed)
+        print(
+            f"{len(queue)} page(s) still to capture — run the same command "
+            f"with --resume to continue."
+        )
+        if retrying:
+            print(
+                f"  ({retrying} of them failed to render and will be retried, "
+                f"so this count will not reach zero while they keep failing.)"
+            )
+    elif failed:
+        # Nothing is queued, but a resume is still not a no-op: failed pages are
+        # put back in the frontier each time, so saying nothing here would make
+        # the next run look like it had invented work.
+        print(
+            f"Nothing is waiting; --resume retries the "
+            f"{len(failed)} failed page(s)."
+        )

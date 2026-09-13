@@ -27,12 +27,51 @@ uv run pytest -m "not e2e"             # fast unit tests only (<1s, needs no bro
 uv run pytest tests/test_urls.py::test_strips_fragment   # single test
 ```
 
-The `sitegraph` entry point is wired through `[project.scripts]`; `uv run python -m sitegraph` is equivalent. The two user-facing commands:
+The `sitegraph` entry point is wired through `[project.scripts]`; `uv run python -m sitegraph` is equivalent. The three user-facing commands:
 
 ```bash
 uv run sitegraph crawl http://localhost:3000
+uv run sitegraph crawl http://localhost:3000 --resume    # carry on a capped crawl
+uv run sitegraph login http://localhost:3000/login       # only for signed-in crawls
 uv run sitegraph serve
 ```
+
+## Stopping early, and carrying on
+
+`--max-pages` caps the pages captured **in one run**. Without `--resume` that cap is a dead end: the crawl stops, and the pages it had discovered but not reached are left with nothing to pick them up. With `--resume` the cap becomes a budget, and *the same command run again* continues from where the last run stopped:
+
+```bash
+uv run sitegraph crawl http://localhost:3000 --max-pages 500            # 500 captured, 312 waiting
+uv run sitegraph crawl http://localhost:3000 --max-pages 500 --resume   # 500 more, counter climbing
+```
+
+**The frontier is reconstructed, not stored.** There is no queue file: every page record already lists the links it contained, so the pages discovered but never reached are exactly the ones named in some record that have no record of their own. That is why there is no second file to keep in sync with `graph.json`, and why resuming works the same whether the previous run stopped at `--max-pages`, met Ctrl-C, or died outright — `crawl.py::resume_state` rebuilds both the graph and the queue from what is on disk.
+
+Consequences worth knowing:
+
+- **A resumed run never re-captures a page.** IDs, screenshots, titles and edges from earlier runs are kept exactly; new pages continue the ID sequence.
+- **Pages that failed to render go back in the queue**, so a page that failed because the server was still starting up heals on the next run. A permanently dead page is retried every time, so the "still to capture" count will not reach zero — the summary says so rather than leaving the user to wonder why run five is still doing something.
+- **Resuming a crawl of a different site is refused.** The stored root is compared against the URL given; a mismatch is an error, because appending to another site's graph would corrupt it.
+- **`--resume` on a finished crawl opens no browser.** An empty queue prints and exits before the renderer is built, so it costs nothing and needs no Chromium.
+
+The frontier is ordered shallowest-first, approximating the breadth-first walk a single run would have made. One known imprecision: a page reachable both through a captured page and through one that is *still* unvisited takes the depth implied by the captured page, which can be one level deeper than its true shortest path. Depth is display metadata, so this is cosmetic.
+
+## Signed-in crawls
+
+Pages behind a login are reached by reusing a session, not by automating one:
+
+```bash
+uv run sitegraph login http://localhost:3000/login       # opens a real window
+uv run sitegraph crawl http://localhost:3000 --storage-state .sitegraph/session.json
+```
+
+`login` opens a visible Chromium and waits for **a human** to authenticate — SSO, MFA, and everything else that cannot be scripted included. sitegraph never sees a credential and never fills a form; it saves the resulting session (Playwright storage state: cookies plus localStorage) and `crawl` replays it. Spec §11 keeps login automation out of scope, and this stays on the right side of that line.
+
+- **Treat the session file as a credential.** Live session cookies are enough for anyone holding the file to act as that user. It defaults to `.sitegraph/session.json`, which is both gitignored and unrouted by `serve` — but it is plaintext, so it should not be copied around with a crawl directory.
+- **A signed-out crawl does not fail, it lies.** A protected page that redirects to a login page gets recorded under its own URL with the *login* page's content and a 200. Nothing errors, and the graph looks fine. The same URL crawled with and without a session is the only way to see the difference — `tests/test_login.py` pins exactly that pair.
+- **A session that expires mid-crawl** has the same effect from that point on: the remaining pages silently become the login page. Re-run `login` and crawl again.
+- **SSO redirects leave the origin**, so the crawl stops at that link rather than following it. That is the same-origin rule working as intended, not a bug.
+- `user:pass@host` in the start URL also reaches Basic/Digest-protected sites, because Chromium caches the credentials for the origin. Prefer `--storage-state`: the credentials-in-URL form is written in plaintext into every node URL in `graph.json` and shows up in the inspector.
 
 ## Architecture
 
@@ -45,14 +84,15 @@ crawl  →  .sitegraph/  →  serve (HTTP)  →  browser UI
 
 Modules, in dependency order — each layer may import the ones above it and nothing below:
 
-| module | owns |
-| --- | --- |
-| `urls.py` | URL identity: normalization, resolution, origins, link filtering |
-| `graph.py` | The graph model: nodes, IDs, edge derivation, serialization |
-| `store.py` | The on-disk layout and atomic JSON writes |
-| `crawl.py` | The BFS walk and the Chromium `Renderer` |
-| `serve.py` | The read-only HTTP server and its route table |
-| `ui/` | `index.html`, `styles.css`, `app.js` — the explorer |
+| module     | owns                                                             |
+| ---------- | ---------------------------------------------------------------- |
+| `urls.py`  | URL identity: normalization, resolution, origins, link filtering |
+| `graph.py` | The graph model: nodes, IDs, edge derivation, serialization      |
+| `store.py` | The on-disk layout and atomic JSON writes                        |
+| `crawl.py` | The BFS walk and the Chromium `Renderer`                         |
+| `login.py` | Interactive sign-in that saves a session for `crawl`             |
+| `serve.py` | The read-only HTTP server and its route table                    |
+| `ui/`      | `index.html`, `styles.css`, `app.js` — the explorer              |
 
 `graph.py` and `urls.py` have no browser or filesystem dependency at all, which is what makes the interesting rules directly testable. `serve.py` must not import `crawl.py` (spec §8 — the server never crawls); `tests/test_serve.py` enforces this in a subprocess.
 
@@ -79,6 +119,7 @@ The HTTP routes over it are equally fixed — `GET /graph.json`, `/pages/<id>.js
 - **Edges are derived from the nodes' links when the graph is serialized, never appended.** A page's links are known when it is visited; its *targets* may not exist yet. Deriving on read means an edge can never reference a missing node.
 - **A link to a page that was never captured is not an edge.** It stays in the page record's `links` (which is where `--max-pages` leftovers remain visible, and the inspector shows them as "not crawled").
 - **`graph.json` never references a page record that is not on disk.** `crawl` writes the page record first, then the graph, and registers a node only once its visit completes. JSON writes go through a temp file and `os.replace`, so a killed crawl leaves parseable files.
+- **A page's links live in its page record, not in the graph.** That is what makes `--resume` possible without a queue file, and it is the reason a page record must keep the *full* link list (including targets that never became nodes) rather than only the ones that did.
 - **Failed pages still appear in the graph**, marked `failed: true` with `screenshot: null`, rather than being dropped. Note that a *failed* page is one that could not render at all — an HTTP 404 renders fine and is recorded normally with `status: 404`.
 - **`screenshot` paths are relative** to the output directory (`screenshots/000012.webp`), never absolute — they must resolve for a `serve` run rooted elsewhere.
 - **Same-origin by default.** The crawl must not leave the origin of the start URL.
