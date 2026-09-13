@@ -24,3 +24,4 @@ claude_env.sh
 # macOS
 .DS_Store
 /.sentinel-sitegraph/
+/.sitegraph-sentinel/

@@ -17,7 +17,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 import pytest
-from fixture_site import run_site
+from fixture_site import _page, run_site
 from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import sync_playwright
 from serving import request, running
@@ -311,6 +311,127 @@ def test_a_narrow_viewport_is_a_different_rendering_not_a_smaller_picture(
     assert corner_of(narrow_dir) == [0, 0, 0], "390px wide should match it"
 
 
+# --- one card per route -------------------------------------------------
+
+
+def shop_site(rows: int = 6) -> dict[str, str]:
+    """A site whose rows each get their own page, as most apps have."""
+    pages = {
+        "/": _page(
+            "Home",
+            "".join(f"<a href='/courses/{n}'>Course {n}</a>" for n in range(rows))
+            + "<a href='/about'>About</a>",
+        ),
+        "/about": _page("About", "<a href='/'>Home</a>"),
+    }
+    for number in range(rows):
+        pages[f"/courses/{number}"] = _page(
+            f"Course {number}", "<a href='/'>Home</a>"
+        )
+    return pages
+
+
+def test_a_route_with_many_instances_draws_one_card(tmp_path: Path) -> None:
+    """The point of the fold: the graph's complexity should track the app's
+    *routes*, not its rows. Eight pages, three of them distinct."""
+    with run_site(shop_site()) as site:
+        output = tmp_path / "shop"
+        crawl(site, output, 100, workers=1)
+
+        graph = json.loads((output / GRAPH_FILE).read_text())
+        assert len(graph["nodes"]) == 8, "every page is still crawled and stored"
+
+        with running(output) as port:
+            with sync_playwright() as playwright:
+                browser = playwright.chromium.launch()
+                page = browser.new_page(viewport={"width": 1400, "height": 880})
+                problems = watch(page)
+                try:
+                    page.goto(f"http://127.0.0.1:{port}/", wait_until="load")
+                    page.wait_for_selector(".node", timeout=15_000)
+                    page.wait_for_timeout(2000)
+
+                    assert page.locator(".node").count() == 3, (
+                        "home, about, and one card for the course route"
+                    )
+                    assert page.locator(".node .count").all_inner_texts() == ["×6"]
+                    assert "/courses/:id" in page.locator(".node .path").all_inner_texts()
+                    assert "8 pages" in page.locator("#counts").inner_text()
+                    # The edges are between routes too, not between pages.
+                    assert page.locator("line.edge").count() <= 4
+                finally:
+                    browser.close()
+
+    assert problems == []
+
+
+def test_a_folded_route_still_reaches_every_instance(tmp_path: Path) -> None:
+    """Folding must not be a way of losing pages: each one is one click away."""
+    with run_site(shop_site()) as site:
+        output = tmp_path / "shop-again"
+        crawl(site, output, 100, workers=1)
+
+        with running(output) as port:
+            with sync_playwright() as playwright:
+                browser = playwright.chromium.launch()
+                page = browser.new_page(viewport={"width": 1400, "height": 880})
+                problems = watch(page)
+                try:
+                    page.goto(f"http://127.0.0.1:{port}/", wait_until="load")
+                    page.wait_for_selector(".node", timeout=15_000)
+                    page.wait_for_timeout(2000)
+
+                    route_id = page.evaluate("""() => {
+                      const card = [...document.querySelectorAll('.node')]
+                        .find((n) => n.innerText.includes('/courses/:id'));
+                      select(card.dataset.id, { center: false });
+                      return card.dataset.id;
+                    }""")
+                    page.wait_for_timeout(400)
+
+                    listed = page.locator(".insp-section.instances .links button")
+                    assert listed.count() == 6, "every instance should be listed"
+
+                    listed.nth(3).click()
+                    page.wait_for_timeout(500)
+                    assert "/courses/" in page.locator("#inspector .url").inner_text()
+                    # ...and the card stays the route's, not the instance's.
+                    assert page.locator(".node.selected").count() == 1
+                    assert page.locator(".node.selected").get_attribute("data-id") == route_id
+                finally:
+                    browser.close()
+
+    assert problems == []
+
+
+def test_folding_is_invisible_on_a_site_without_identifiers(
+    site: str, tmp_path: Path
+) -> None:
+    """The fixture site's URLs are all named pages, so nothing folds and the
+    view is what it always was."""
+    output = tmp_path / "plain"
+    crawl(site, output, 100, workers=1)
+    graph = json.loads((output / GRAPH_FILE).read_text())
+
+    with running(output) as port:
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch()
+            page = browser.new_page(viewport={"width": 1400, "height": 880})
+            problems = watch(page)
+            try:
+                page.goto(f"http://127.0.0.1:{port}/", wait_until="load")
+                page.wait_for_selector(".node", timeout=15_000)
+                page.wait_for_timeout(2500)
+
+                assert page.locator(".node").count() == len(graph["nodes"])
+                assert page.locator(".node .count").count() == 0, "nothing to badge"
+                assert "pages ·" not in page.locator("#counts").inner_text()
+            finally:
+                browser.close()
+
+    assert problems == []
+
+
 # --- the browser UI -----------------------------------------------------
 
 
@@ -343,7 +464,9 @@ def test_ui_renders_the_graph(crawled: Path, graph: dict) -> None:
 
                 assert page.locator(".node").count() == len(graph["nodes"])
                 assert page.locator("line.edge").count() == len(graph["edges"])
-                assert "pages" in page.locator("#counts").inner_text()
+                counts = page.locator("#counts").inner_text()
+                assert f"{len(graph['nodes'])} routes" in counts
+                assert "links" in counts
             finally:
                 browser.close()
 
@@ -430,7 +553,9 @@ def test_ui_contact_sheet_and_filter(crawled: Path, graph: dict) -> None:
                 page.wait_for_timeout(300)
                 visible = page.locator(".tile:visible").count()
                 assert 0 < visible < len(graph["nodes"])
-                assert "pages" in page.locator("#counts").inner_text()
+                counts = page.locator("#counts").inner_text()
+                assert f"{len(graph['nodes'])} routes" in counts
+                assert "links" in counts
 
                 # A tile opens the same inspector the graph uses.
                 page.locator(".tile:visible").first.click()

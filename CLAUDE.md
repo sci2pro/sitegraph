@@ -33,10 +33,92 @@ The `sitegraph` entry point is wired through `[project.scripts]`; `uv run python
 uv run sitegraph crawl http://localhost:3000
 uv run sitegraph crawl http://localhost:3000 --workers 8     # render more at once
 uv run sitegraph crawl http://localhost:3000 --viewport 390x844   # capture a phone layout
+uv run sitegraph crawl http://localhost:3000 --per-pattern 1   # one page per route
+uv run sitegraph crawl http://localhost:3000 --skip /admin    # leave a path alone
 uv run sitegraph crawl http://localhost:3000 --resume        # carry on a capped crawl
 uv run sitegraph login http://localhost:3000/login           # only for signed-in crawls
 uv run sitegraph serve
 ```
+
+## Leaving paths alone
+
+```bash
+uv run sitegraph crawl localhost:3000 --skip /admin --skip 're:\.pdf$'
+```
+
+`--skip` is repeatable, and `urls.py::SkipRules` owns what a pattern means:
+
+- **A literal is a path prefix that ends on a segment edge.** `/admin` covers
+  `/admin`, `/admin/` and `/admin/users`, but *not* `/administrators`, which is
+  a different page that merely starts with the same letters. A plain
+  `startswith` would swallow every neighbour of what you meant to skip, and you
+  would only find out by noticing what went missing.
+- **Anything else is a regex, marked `re:`.** The prefix removes the guesswork:
+  deciding by "does it look like a regex" would make `--skip /report.html` a
+  pattern whose `.` matches any character — harmless there, and a nasty
+  surprise the first time it is not.
+- Each kind is matched against the path (a regex against path and query, so
+  `re:page=\d+` works). Neither matches the host, because a crawl is on one
+  origin and repeating it in every pattern would be noise.
+- A pattern that cannot match is refused at the command line, not silently
+  ignored: `--skip admin` is an error naming `'/admin'` and `'re:admin'`, and
+  so is a regex that does not compile.
+
+Three consequences worth knowing, and they are the same ones `--per-pattern`
+has, for the same reason:
+
+- **It is lossy.** Nothing behind a skipped page is discovered — the fixture's
+  `/deep`, reachable only through a skipped `.pdf`, does not appear at all.
+- **The skipped URL is still recorded as a link.** The page that pointed at it
+  did point at it, so the inspector shows it as "not crawled" rather than
+  pretending the link is not there. The summary says how many were left out.
+- **A pattern matching the start URL is refused**, because the alternative is
+  an empty crawl that looks like a broken one.
+
+Skipping is checked before the `--per-pattern` allowance, so a page nobody will
+capture does not use up the budget of the route it happens to share.
+
+## One card per route, not per row
+
+A site's node count should track its *routes*, not its database rows. Five
+hundred courses are one route rendered five hundred times, and drawing them all
+makes the graph's complexity mirror the data rather than the application.
+
+    /courses/123           ┐
+    /courses/456           ├─▶  one card, `/courses/:id`, badged ×500
+    ... 498 more           ┘
+
+`urls.py::url_shape` is the single owner of the rule: **identifier-shaped path
+segments and query values become `:id`**, where identifier-shaped means
+all-digits or a UUID. Nothing else. A rule broad enough to catch `/users/alice`
+would also merge `/about` with `/contact` and collapse every top-level page into
+one node, so slugs are deliberately not folded; that is the known gap.
+
+- **The payload changes by one optional field.** `to_dict` writes `"shape"`
+  only for a page that is one instance of a route, so a site with no
+  identifiers in its URLs produces exactly the graph it produced before shapes
+  existed, and an absent `shape` means "this URL is its own shape".
+- **The view folds at load** (`app.js::foldByShape`), keeping only the
+  representative in `state.nodes`. That is what leaves every id-keyed structure
+  below it — positions, cards, edges, selection, filtering — untouched.
+  `state.byId` still holds *every* page, so the inspector can open any instance
+  and links between pages still resolve.
+- **Edges are folded too**, through the representative, with self-route edges
+  dropped and the rest deduplicated. Otherwise the edges multiply by the
+  instance count alongside the nodes.
+- **The representative is the first member that rendered**, not simply the
+  first, so a route does not look broken because instance one happened to 404.
+  Under a pool "first" means first *committed*, which is completion order.
+- **The inspector lists the instances**, so folding is never a way of losing
+  pages: every one is one click away, with its own status.
+
+`--per-pattern K` is the other half, and it is **opt-in because it is lossy**: a
+page linked only from an instance that was passed over is never discovered.
+Crawling the first page of each route instead of all five hundred is a real
+saving on a large site and a real risk of an incomplete graph, so it is the
+user's call rather than a default. The pages passed over stay in the referring
+page's `links` (visible as "not crawled"), and `--resume` with a larger cap
+takes them.
 
 ## Capture size
 

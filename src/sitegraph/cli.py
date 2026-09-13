@@ -51,6 +51,22 @@ def _viewport(value: str) -> tuple[int, int]:
         raise argparse.ArgumentTypeError(str(exc)) from None
 
 
+def _skip(value: str) -> str:
+    """argparse type for a skip pattern: valid, or rejected at the command line.
+
+    A pattern that can never match — a bare ``admin``, or a regex that does not
+    compile — is worth refusing here rather than discovering as a crawl that
+    quietly skipped nothing.
+    """
+    from sitegraph.urls import InvalidSkipPattern, SkipRules
+
+    try:
+        SkipRules([value])
+    except InvalidSkipPattern as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
+    return value
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Return the fully configured argument parser."""
     parser = argparse.ArgumentParser(
@@ -99,6 +115,31 @@ def build_parser() -> argparse.ArgumentParser:
             "size to render pages at, which is also the size of every "
             f"screenshot (default: {DEFAULT_VIEWPORT}). A narrow one gets the "
             "responsive layout, so this changes what the pages look like"
+        ),
+    )
+    crawl.add_argument(
+        "--skip",
+        action="append",
+        type=_skip,
+        default=None,
+        metavar="PATTERN",
+        help=(
+            "leave a path uncrawled, e.g. /admin; repeatable. Matches the path "
+            "up to a segment edge, so /admin covers /admin/users but not "
+            "/administrators. Prefix with re: for a regex, e.g. 're:\\.pdf$'. "
+            "Skipped pages are still recorded as links, so they show as "
+            "not crawled rather than disappearing"
+        ),
+    )
+    crawl.add_argument(
+        "--per-pattern",
+        type=_positive,
+        default=None,
+        metavar="K",
+        help=(
+            "capture at most K pages of any one route, e.g. one /courses/:id "
+            "instead of five hundred. Lossy: a page linked only from an "
+            "instance passed over is never discovered"
         ),
     )
     crawl.add_argument(
@@ -164,6 +205,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             crawl(
                 url=args.url,
                 viewport=args.viewport,
+                per_pattern=args.per_pattern,
+                skip=args.skip,
                 output=Path(args.output),
                 max_pages=args.max_pages,
                 resume=args.resume,

@@ -255,10 +255,36 @@ body.inspecting main {
 }
 
 .node .title {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
   font-weight: 550;
-  white-space: nowrap;
+}
+
+/* The badge must not be the thing that gets ellipsised when a title is long. */
+.title .label {
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* How many pages this one card stands for. */
+.count {
+  flex: none;
+  margin-left: auto;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  color: var(--accent);
+  font-size: 10px;
+  font-weight: 500;
+}
+
+.node.selected .count,
+.tile.selected .count {
+  border-color: var(--accent);
 }
 
 .node .path {
@@ -399,10 +425,10 @@ body.inspecting main {
 }
 
 .tile .title {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
   font-weight: 550;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
 }
 
 .tile .path {
@@ -595,6 +621,16 @@ body.inspecting main {
   color: var(--faint);
   font-size: 12px;
   font-style: italic;
+}
+
+/* The instance the inspector is currently showing, within its route. */
+.links button.current {
+  background: var(--panel-2);
+  border-color: var(--accent);
+}
+
+.insp-section.instances .swatch {
+  background: var(--accent);
 }
 
 /* A link whose target was never crawled (cut off by --max-pages) is real data

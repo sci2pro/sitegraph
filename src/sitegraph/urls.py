@@ -26,19 +26,24 @@ the server can depend on it cheaply.
 from __future__ import annotations
 
 import ipaddress
+import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 from urllib.parse import quote, urljoin, urlsplit
 
 __all__ = [
+    "InvalidSkipPattern",
     "InvalidURL",
     "Origin",
+    "REGEX_PREFIX",
+    "SkipRules",
     "internal_links",
     "is_loopback",
     "is_internal",
     "normalize_url",
     "origin_of",
     "resolve_href",
+    "url_shape",
 ]
 
 
@@ -281,6 +286,160 @@ def is_internal(url: str, origin: Origin) -> bool:
         return origin_of(url) == origin
     except InvalidURL:
         return False
+
+
+#: What an identifier becomes in a shape. Deliberately not something that
+#: could occur in a real URL, so a shape can never be mistaken for a page.
+PLACEHOLDER = ":id"
+
+_UUID = re.compile(
+    r"\A[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\Z"
+)
+
+
+def is_identifier(part: str) -> bool:
+    """Return whether *part* looks like a row's key rather than a page's name."""
+    if part.isascii() and part.isdigit():
+        return True
+    return bool(_UUID.match(part))
+
+
+def _shape_param(param: str) -> str:
+    name, separator, value = param.partition("=")
+    if separator and is_identifier(value):
+        return f"{name}={PLACEHOLDER}"
+    return param
+
+
+def url_shape(url: str) -> str:
+    """Return *url* with its identifiers replaced by ``:id``.
+
+    The shape is what a page *is* rather than which row it shows::
+
+        /courses/123              ->  /courses/:id
+        /courses/123/edit         ->  /courses/:id/edit
+        /orders/550e8400-e29b-... ->  /orders/:id
+        /items?page=2             ->  /items?page=:id
+        /about                    ->  /about
+
+    Only identifiers fold. All-digits and UUIDs are treated as row keys;
+    anything else is taken to be part of the route's name, because a rule broad
+    enough to catch ``/users/alice`` would also merge ``/about`` with
+    ``/contact`` and collapse every top-level page into one node. A URL that
+    contains no identifier is its own shape, which is why this returns the
+    normalized URL rather than something empty.
+
+    The shape is *not* a URL anyone can visit — see `PLACEHOLDER` — but it is
+    normalized like one, so two spellings of the same route share a shape.
+    """
+    parts = urlsplit(normalize_url(url))
+    path = "/".join(
+        PLACEHOLDER if is_identifier(segment) else segment
+        for segment in parts.path.split("/")
+    )
+    shape = f"{parts.scheme}://{parts.netloc}{path}"
+    if parts.query:
+        params = "&".join(_shape_param(param) for param in parts.query.split("&"))
+        shape += f"?{params}"
+    return shape
+
+
+#: Prefix that marks a skip pattern as a regular expression rather than a path.
+REGEX_PREFIX = "re:"
+
+
+class InvalidSkipPattern(ValueError):
+    """Raised when a skip pattern could never match, or is not a regex at all."""
+
+
+def _is_prefix_at_segment(path: str, literal: str) -> bool:
+    """Return whether *literal* begins *path* and ends on a segment boundary.
+
+    ``/admin`` covers ``/admin``, ``/admin/`` and ``/admin/users`` — but not
+    ``/administrators``, which is a different page that merely starts with the
+    same letters. A plain ``startswith`` would swallow every neighbour of
+    whatever you meant to skip, and you would only find out by looking at what
+    went missing.
+    """
+    if literal.endswith("/"):
+        # The boundary is in the pattern already.
+        return path.startswith(literal)
+    if not path.startswith(literal):
+        return False
+    return len(path) == len(literal) or path[len(literal)] == "/"
+
+
+def _path_of(url: str) -> str:
+    return urlsplit(url).path
+
+
+def _path_and_query(url: str) -> str:
+    parts = urlsplit(url)
+    return parts.path + (f"?{parts.query}" if parts.query else "")
+
+
+class SkipRules:
+    """The URLs a crawl has been told to leave alone.
+
+    A **literal** is a path prefix that ends on a segment edge:
+
+        --skip /admin      covers /admin, /admin/, /admin/users
+                           but not /administrators
+
+    Anything else is a **regex**, marked with a ``re:`` prefix:
+
+        --skip 're:\\.pdf$'     --skip 're:/page/\\d+'
+
+    The prefix removes the guesswork: deciding by "does it look like a regex"
+    would make ``--skip /report.html`` a pattern whose ``.`` matches any
+    character — harmless there, and a nasty surprise the first time it is not.
+
+    Both kinds match the **path**, and a regex the path and query together.
+    Neither matches the host, because a crawl stays on one origin and making
+    every pattern repeat it would be noise.
+    """
+
+    def __init__(self, patterns: Iterable[str] = ()) -> None:
+        self.patterns = list(patterns)
+        self._literals: list[str] = []
+        self._regexes: list[re.Pattern[str]] = []
+
+        for pattern in self.patterns:
+            if pattern.startswith(REGEX_PREFIX):
+                body = pattern[len(REGEX_PREFIX) :]
+                try:
+                    self._regexes.append(re.compile(body))
+                except re.error as exc:
+                    raise InvalidSkipPattern(
+                        f"{pattern!r} is not a valid regex: {exc}"
+                    ) from None
+                continue
+            if not pattern.startswith("/"):
+                # It can never match a path, and a pattern that quietly matches
+                # nothing is worse than one that is rejected. Someone pasting a
+                # whole URL probably means its path, so say so.
+                as_path = (
+                    urlsplit(pattern).path if "://" in pattern else f"/{pattern}"
+                )
+                raise InvalidSkipPattern(
+                    f"{pattern!r} cannot match anything: patterns are matched "
+                    f"against the path, so they begin with '/'. Try {as_path!r}, "
+                    f"or {f'{REGEX_PREFIX}{pattern}'!r} to match anywhere in it"
+                )
+            self._literals.append(pattern)
+
+    def __bool__(self) -> bool:
+        return bool(self._literals or self._regexes)
+
+    def matches(self, url: str) -> bool:
+        """Return whether *url* is one the crawl should not visit."""
+        if self._literals and any(
+            _is_prefix_at_segment(_path_of(url), literal)
+            for literal in self._literals
+        ):
+            return True
+        return any(regex.search(_path_and_query(url)) for regex in self._regexes)
 
 
 def is_loopback(origin: Origin) -> bool:

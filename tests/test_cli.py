@@ -106,6 +106,62 @@ def test_crawl_rejects_an_impossible_viewport(value: str) -> None:
         build_parser().parse_args(["crawl", "http://x/", "--viewport", value])
 
 
+def test_crawl_skips_nothing_by_default() -> None:
+    args = build_parser().parse_args(["crawl", "http://localhost:3000"])
+
+    assert args.skip is None
+
+
+def test_crawl_accepts_several_skip_patterns() -> None:
+    args = build_parser().parse_args(
+        [
+            "crawl",
+            "http://x/",
+            "--skip",
+            "/admin",
+            "--skip",
+            r"re:\.pdf$",
+            "--skip",
+            "/logout",
+        ]
+    )
+
+    assert args.skip == ["/admin", r"re:\.pdf$", "/logout"]
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "admin",  # cannot match a path, which always starts with "/"
+        "http://x/admin",  # a URL, not a path
+        "re:[unclosed",  # not a regex
+    ],
+)
+def test_crawl_rejects_an_unusable_skip_pattern(value: str) -> None:
+    """Rejected at the command line rather than as a crawl that quietly
+    skipped nothing."""
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["crawl", "http://x/", "--skip", value])
+
+
+def test_crawl_captures_every_instance_by_default() -> None:
+    args = build_parser().parse_args(["crawl", "http://localhost:3000"])
+
+    assert args.per_pattern is None, "capping is lossy, so it is opt-in"
+
+
+def test_crawl_accepts_a_per_pattern_cap() -> None:
+    args = build_parser().parse_args(["crawl", "http://x/", "--per-pattern", "3"])
+
+    assert args.per_pattern == 3
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "one"])
+def test_crawl_rejects_an_impossible_pattern_cap(value: str) -> None:
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["crawl", "http://x/", "--per-pattern", value])
+
+
 def test_crawl_lets_the_host_decide_the_worker_count() -> None:
     """None rather than a number: how many workers is right depends on whether
     the target is this machine, which the parser cannot know."""

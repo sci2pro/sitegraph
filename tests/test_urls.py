@@ -11,14 +11,17 @@ from __future__ import annotations
 import pytest
 
 from sitegraph.urls import (
+    InvalidSkipPattern,
     InvalidURL,
     Origin,
+    SkipRules,
     internal_links,
     is_internal,
     is_loopback,
     normalize_url,
     origin_of,
     resolve_href,
+    url_shape,
 )
 
 # (input, expected canonical form)
@@ -266,6 +269,162 @@ def test_origin_str() -> None:
 )
 def test_is_internal(url: str, internal: bool) -> None:
     assert is_internal(url, origin_of("http://example.com/")) is internal
+
+
+# --- route shapes -----------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("url", "shape"),
+    [
+        # identifiers fold
+        ("http://example.com/courses/123", "http://example.com/courses/:id"),
+        ("http://example.com/courses/123/edit", "http://example.com/courses/:id/edit"),
+        ("http://example.com/2019/03/hello", "http://example.com/:id/:id/hello"),
+        (
+            "http://example.com/orders/550e8400-e29b-41d4-a716-446655440000",
+            "http://example.com/orders/:id",
+        ),
+        ("http://example.com/items?page=2", "http://example.com/items?page=:id"),
+        (
+            "http://example.com/courses/12?page=3&sort=name",
+            "http://example.com/courses/:id?page=:id&sort=name",
+        ),
+        # a trailing slash is a different route, as it is a different page
+        ("http://example.com/courses/12/", "http://example.com/courses/:id/"),
+        # ...and so is the host
+        ("http://other.com/courses/12", "http://other.com/courses/:id"),
+        # names do not fold
+        ("http://example.com/courses/abc", "http://example.com/courses/abc"),
+        ("http://example.com/users/alice", "http://example.com/users/alice"),
+        ("http://example.com/search?q=foo", "http://example.com/search?q=foo"),
+        # a version is not a row
+        ("http://example.com/v2/courses", "http://example.com/v2/courses"),
+        # nothing to fold
+        ("http://example.com/", "http://example.com/"),
+        ("http://example.com/about", "http://example.com/about"),
+        # an escape that is not a separator stays one segment
+        ("http://example.com/a%2Fb", "http://example.com/a%2Fb"),
+    ],
+)
+def test_url_shape(url: str, shape: str) -> None:
+    assert url_shape(url) == shape
+
+
+@pytest.mark.parametrize(
+    ("left", "right"),
+    [
+        # The rule has to stay narrow enough to keep these apart. A rule broad
+        # enough to catch /users/alice would merge every top-level page.
+        ("http://example.com/about", "http://example.com/contact"),
+        ("http://example.com/login", "http://example.com/logout"),
+        ("http://example.com/courses/new", "http://example.com/courses/edit"),
+        # "new" is part of the route, not a row key
+        ("http://example.com/courses/new", "http://example.com/courses/7"),
+    ],
+)
+def test_shapes_that_must_stay_apart(left: str, right: str) -> None:
+    assert url_shape(left) != url_shape(right)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://example.com/courses/123",
+        "http://example.com/courses/123/edit",
+        "http://example.com/orders/550e8400-e29b-41d4-a716-446655440000",
+        "http://example.com/items?page=2",
+        "http://example.com/about",
+        "http://example.com/courses/12/",
+    ],
+)
+def test_shaping_is_idempotent(url: str) -> None:
+    """A shape is not a page, but it is stable — feeding one back changes
+    nothing, so nothing downstream can oscillate."""
+    once = url_shape(url)
+    assert url_shape(once) == once
+
+
+def test_a_shape_is_not_a_url_anyone_can_visit() -> None:
+    assert url_shape("http://example.com/courses/123") != (
+        "http://example.com/courses/123"
+    )
+
+
+# --- skip rules -------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("patterns", "url", "skipped"),
+    [
+        # a literal covers the path and everything under it...
+        (["/admin"], "http://h/admin", True),
+        (["/admin"], "http://h/admin/", True),
+        (["/admin"], "http://h/admin/users", True),
+        (["/admin"], "http://h/admin?tab=1", True),
+        # ...but only across a whole segment
+        (["/admin"], "http://h/administrators", False),
+        (["/admin"], "http://h/admin-panel", False),
+        (["/admin"], "http://h/user/admin", False),
+        # a trailing slash says the same thing explicitly
+        (["/admin/"], "http://h/admin/users", True),
+        (["/admin/"], "http://h/admin/x", True),
+        # a regex reaches what a literal cannot
+        ([r"re:\.pdf$"], "http://h/files/q3.pdf", True),
+        ([r"re:\.pdf$"], "http://h/report.html", False),
+        ([r"re:/page/\d+"], "http://h/page/12", True),
+        ([r"re:page=\d+"], "http://h/x?page=12", True),
+        ([r"re:^/search"], "http://h/search?q=1", True),
+        ([r"re:^/search"], "http://h/deep/search", False),
+        # several patterns are a union
+        (["/admin", r"re:\.pdf$"], "http://h/admin", True),
+        (["/admin", r"re:\.pdf$"], "http://h/a.pdf", True),
+        (["/admin", r"re:\.pdf$"], "http://h/about", False),
+        # the host is not part of what is matched
+        (["/admin"], "http://other.example/admin", True),
+        # a literal is matched as text, not as a pattern
+        (["/report.html"], "http://h/reportXhtml", False),
+        (["/report.html"], "http://h/report.html", True),
+    ],
+)
+def test_skip_rules(patterns: list[str], url: str, skipped: bool) -> None:
+    assert SkipRules(patterns).matches(url) is skipped
+
+
+def test_no_patterns_skips_nothing() -> None:
+    rules = SkipRules()
+
+    assert not rules
+    assert rules.matches("http://h/anything") is False
+
+
+@pytest.mark.parametrize(
+    ("pattern", "expected"),
+    [
+        # A pattern that can never match is rejected rather than silently
+        # matching nothing: a path always starts with "/".
+        ("admin", "cannot match"),
+        ("http://example.com/admin", "cannot match"),  # a URL, not a path
+        ("re:[unclosed", "not a valid regex"),
+        ("re:(?P<nothing", "not a valid regex"),
+    ],
+)
+def test_unusable_skip_patterns_are_rejected(pattern: str, expected: str) -> None:
+    with pytest.raises(InvalidSkipPattern) as excinfo:
+        SkipRules([pattern])
+
+    assert expected in str(excinfo.value)
+
+
+def test_a_rejected_skip_pattern_says_what_to_write_instead() -> None:
+    """Including for someone who pasted a whole URL, which is the easy
+    mistake."""
+    with pytest.raises(InvalidSkipPattern) as excinfo:
+        SkipRules(["http://example.com/admin"])
+
+    message = str(excinfo.value)
+    assert "'/admin'" in message, message
+    assert "'re:http://example.com/admin'" in message, message
 
 
 # --- loopback ---------------------------------------------------------------

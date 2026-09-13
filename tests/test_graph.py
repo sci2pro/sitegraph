@@ -201,6 +201,29 @@ def test_page_dict_carries_the_richer_record() -> None:
     }
 
 
+def test_a_parameterised_page_records_its_route() -> None:
+    graph = Graph()
+    graph.add_page("http://example.com/courses/123")
+
+    assert graph.nodes[0].shape == "http://example.com/courses/:id"
+    assert graph.to_dict()["nodes"][0]["shape"] == "http://example.com/courses/:id"
+
+
+def test_a_plain_page_carries_no_shape_in_the_payload() -> None:
+    """Absent means "this URL is its own shape", so a site with no identifiers
+    in its URLs produces exactly the payload it produced before shapes."""
+    graph = Graph()
+    graph.add_page("http://example.com/about")
+    graph.add_page("http://example.com/courses/new")
+
+    payload = graph.to_dict()
+    for node in payload["nodes"]:
+        assert "shape" not in node, node
+    assert graph.nodes[0].shape == "http://example.com/about", (
+        "the node still knows its own shape; only the payload leaves it out"
+    )
+
+
 def test_failed_pages_stay_in_the_graph() -> None:
     """Spec §7: a page that fails to render is still a node, marked failed."""
     graph = Graph()

@@ -21,7 +21,8 @@ import os
 import signal
 import sys
 import time
-from collections import deque
+from collections import Counter, deque
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from queue import Empty, Queue
@@ -43,10 +44,12 @@ from sitegraph.store import (
 from sitegraph.urls import (
     InvalidURL,
     Origin,
+    SkipRules,
     internal_links,
     is_loopback,
     normalize_url,
     origin_of,
+    url_shape,
 )
 
 __all__ = [
@@ -721,6 +724,8 @@ def crawl(
     resume: bool = False,
     workers: int | None = None,
     viewport: tuple[int, int] | None = None,
+    per_pattern: int | None = None,
+    skip: Iterable[str] | None = None,
     storage_state: Path | None = None,
     renderer: Renderer | None = None,
     renderer_factory=None,
@@ -746,6 +751,19 @@ def crawl(
     same page — a narrow viewport gets the responsive layout, which is the
     point of asking for one. Defaults to spec §7's 1440x900.
 
+    *per_pattern* caps how many pages are captured per route shape — one
+    ``/courses/:id`` instead of five hundred. **This one is lossy**: a page
+    linked only from an instance that was passed over is never discovered, so
+    it is off by default. The pages passed over are still *known* (they stay in
+    the referring page's links, and show as "not crawled"), and resuming with a
+    larger cap picks them up.
+
+    *skip* is paths to leave alone — see `urls.SkipRules` for what a pattern
+    means. Like the cap it is lossy in the same way, and for the same reason:
+    nothing behind a skipped page is discovered. The skipped URL is still
+    recorded as the link it is, so the graph shows that the page is there and
+    merely uncaptured, rather than pretending the link does not exist.
+
     *storage_state* is a session saved by `sitegraph login`, used to reach
     pages that require a sign-in, and it is why a signed-in crawl is limited to
     a single worker: separate browsers have separate cookie jars, so a session
@@ -764,6 +782,16 @@ def crawl(
         raise ValueError(
             "a single renderer cannot serve more than one worker; "
             "pass renderer_factory to inject a pool"
+        )
+
+    rules = SkipRules(skip or ())
+    if rules.matches(root_url):
+        # Every other consequence of a bad pattern is a page that is merely
+        # missing; this one is an empty crawl, and it should not need reading
+        # the output to notice.
+        raise ValueError(
+            f"--skip matches the start URL {root_url!r}, which would leave "
+            f"nothing to crawl"
         )
 
     count = worker_count(origin, 1 if renderer is not None else workers)
@@ -855,6 +883,10 @@ def crawl(
     in_flight: dict[int, _Job] = {}
     dispatched = 0
     next_seq = 0
+    #: How many pages of each route shape have been taken, when capping.
+    per_shape: Counter[str] = Counter()
+    passed_over = 0
+    skipped = 0
 
     def absorb(message: object) -> None:
         """Commit a finished page, if that is what *message* is."""
@@ -903,7 +935,16 @@ def crawl(
         wedged = teardown()
         store.write_graph(graph)
         print()
-        _report(graph, output, committed, queue, started, len(in_flight))
+        _report(
+            graph,
+            output,
+            committed,
+            queue,
+            started,
+            len(in_flight),
+            passed_over,
+            skipped,
+        )
         print(reason)
         if wedged:
             _leave_now(code)
@@ -915,6 +956,24 @@ def crawl(
             # or the workers would overshoot it by up to a window's worth.
             while queue and len(in_flight) < live and dispatched < max_pages:
                 page_url, depth = queue.popleft()
+
+                if rules and rules.matches(page_url):
+                    # Checked before the per-pattern cap, so a page nobody is
+                    # going to capture does not use up a route's allowance.
+                    skipped += 1
+                    continue
+
+                if per_pattern is not None:
+                    shape = url_shape(page_url)
+                    if per_shape[shape] >= per_pattern:
+                        # Dropped from the frontier, not from the crawl: it is
+                        # still a link in the page that pointed here, so the
+                        # inspector shows it as "not crawled" and a later
+                        # --resume with a larger cap can take it.
+                        passed_over += 1
+                        continue
+                    per_shape[shape] += 1
+
                 job = _Job(
                     seq=next_seq,
                     url=page_url,
@@ -965,7 +1024,9 @@ def crawl(
     # The workers are idle at this point (nothing is in flight), but they are
     # still holding browsers open until they are told to stop.
     teardown()
-    _report(graph, output, committed, queue, started)
+    _report(
+        graph, output, committed, queue, started, passed_over=passed_over, skipped=skipped
+    )
     print(f"\nExplore with:  sitegraph serve --dir {output}")
 
 
@@ -1036,6 +1097,8 @@ def _report(
     queue: deque[tuple[str, int]],
     started: float,
     abandoned: int = 0,
+    passed_over: int = 0,
+    skipped: int = 0,
 ) -> None:
     """Print the end-of-crawl summary.
 
@@ -1077,4 +1140,19 @@ def _report(
         print(
             f"Nothing is waiting; --resume retries the "
             f"{len(failed)} failed page(s)."
+        )
+
+    if skipped:
+        print(
+            f"{skipped} page(s) skipped by --skip; they remain visible as "
+            f"uncaptured links."
+        )
+
+    if passed_over:
+        # Not "waiting": these were dropped from the frontier on purpose, and
+        # only a larger cap brings them back. Say which knob, or the count looks
+        # like something the crawler failed to do.
+        print(
+            f"{passed_over} further page(s) of a route already seen were left "
+            f"uncaptured (--per-pattern); raise it and --resume to take them."
         )

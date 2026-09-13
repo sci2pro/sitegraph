@@ -24,7 +24,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit
 
-from sitegraph.urls import normalize_url
+from sitegraph.urls import normalize_url, url_shape
 
 __all__ = ["Graph", "Node"]
 
@@ -55,6 +55,10 @@ class Node:
     depth: int
     status: int | None
     screenshot: str | None
+    #: The route this page is one instance of, e.g. ``/courses/:id``. Equal to
+    #: ``url`` when the page has no identifier in it, which is most pages; the
+    #: payload leaves it out in that case rather than repeating the URL.
+    shape: str = ""
     failed: bool = False
     error: str | None = None
     links: list[str] = field(default_factory=list)
@@ -152,6 +156,10 @@ class Graph:
             depth=depth,
             status=status,
             screenshot=screenshot,
+            # Which route this page is an instance of. Computed once here
+            # rather than re-derived by each reader: a second implementation of
+            # the rule is exactly what `urls.py` exists to prevent.
+            shape=url_shape(canonical),
             failed=failed,
             error=error,
             links=links or [],
@@ -182,6 +190,11 @@ class Graph:
 
         Self-contained and independent of the per-page files — everything the
         graph view needs to draw is here.
+
+        ``shape`` is written only for a page that is one instance of a route,
+        so a site with no identifiers in its URLs produces exactly the payload
+        it produced before shapes existed. The graph view reads an absent
+        ``shape`` as "this URL is its own shape".
         """
         return {
             "root": self.root_id,
@@ -194,6 +207,7 @@ class Graph:
                     "status": node.status,
                     "failed": node.failed,
                     "screenshot": node.screenshot,
+                    **({"shape": node.shape} if node.shape != node.url else {}),
                 }
                 for node in self._nodes
             ],

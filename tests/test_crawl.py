@@ -713,6 +713,226 @@ def test_resume_does_not_write_until_a_browser_is_running(tmp_path: Path) -> Non
     assert (tmp_path / GRAPH_FILE).read_bytes() == before
 
 
+# --- one page per route, on request -------------------------------------
+
+
+def shop(count: int = 5) -> dict[str, PageResult]:
+    """A site whose rows each have their own page, as a real one would."""
+    pages = {ROOT: result(*[f"/courses/{n}" for n in range(count)])}
+    for number in range(count):
+        pages[f"http://example.com/courses/{number}"] = result("/")
+    return pages
+
+
+def test_without_a_cap_every_instance_is_captured(tmp_path: Path) -> None:
+    crawl(ROOT, tmp_path, 100, renderer=FakeRenderer(shop()))
+
+    assert len(read_graph(tmp_path)["nodes"]) == 6
+
+
+def test_a_cap_takes_the_first_instances_of_a_route(tmp_path: Path) -> None:
+    crawl(ROOT, tmp_path, 100, per_pattern=2, renderer=FakeRenderer(shop()))
+
+    captured = set(nodes_by_url(tmp_path))
+    assert captured == {ROOT, "http://example.com/courses/0", "http://example.com/courses/1"}
+
+
+def test_a_cap_leaves_the_passed_over_pages_discoverable(tmp_path: Path) -> None:
+    """They are not crawled, but they are not lost either: the page that
+    linked to them still names them, which is what the inspector shows as
+    "not crawled" — and what a later resume follows."""
+    crawl(ROOT, tmp_path, 100, per_pattern=1, renderer=FakeRenderer(shop()))
+
+    record = json.loads((tmp_path / PAGES_DIR / "000001.json").read_text())
+    assert record["links"] == [f"http://example.com/courses/{n}" for n in range(5)]
+
+
+def test_a_cap_can_be_lifted_by_resuming(tmp_path: Path) -> None:
+    crawl(ROOT, tmp_path, 100, per_pattern=1, renderer=FakeRenderer(shop()))
+    assert len(read_graph(tmp_path)["nodes"]) == 2
+
+    crawl(ROOT, tmp_path, 100, per_pattern=5, resume=True, renderer=FakeRenderer(shop()))
+
+    assert len(read_graph(tmp_path)["nodes"]) == 6
+
+
+def test_a_cap_reports_what_it_passed_over(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """Silently capturing four of five pages would read as a crawler that
+    missed them."""
+    crawl(ROOT, tmp_path, 100, per_pattern=1, renderer=FakeRenderer(shop()))
+
+    out = capsys.readouterr().out
+    assert "4 further page(s) of a route already seen" in out
+    assert "--per-pattern" in out
+
+
+def test_a_cap_does_not_touch_pages_that_are_their_own_route(tmp_path: Path) -> None:
+    """Only routes with identifiers are capped; /about and /contact are two
+    routes, and a cap of one must not merge them."""
+    pages = {
+        ROOT: result("/about", "/contact", "/courses/1", "/courses/2"),
+        "http://example.com/about": result(),
+        "http://example.com/contact": result(),
+        "http://example.com/courses/1": result(),
+        "http://example.com/courses/2": result(),
+    }
+    crawl(ROOT, tmp_path, 100, per_pattern=1, renderer=FakeRenderer(pages))
+
+    captured = set(nodes_by_url(tmp_path))
+    assert "http://example.com/about" in captured
+    assert "http://example.com/contact" in captured
+    assert "http://example.com/courses/2" not in captured
+
+
+def test_a_page_linked_only_from_a_passed_over_instance_is_never_found(
+    tmp_path: Path,
+) -> None:
+    """The cost of the cap, pinned so it is a documented property rather than a
+    surprise: the link lives on an instance that was never loaded."""
+    pages = {
+        ROOT: result("/courses/1", "/courses/2"),
+        "http://example.com/courses/1": result(),
+        "http://example.com/courses/2": result("/hidden"),
+        "http://example.com/hidden": result(),
+    }
+    crawl(ROOT, tmp_path, 100, per_pattern=1, renderer=FakeRenderer(pages))
+
+    assert "http://example.com/hidden" not in nodes_by_url(tmp_path)
+    # ...but without the cap it is found, which is what the cap costs.
+    other = tmp_path / "uncapped"
+    crawl(ROOT, other, 100, renderer=FakeRenderer(pages))
+    assert "http://example.com/hidden" in nodes_by_url(other)
+
+
+# --- leaving paths alone -------------------------------------------------
+
+
+def mixed_site() -> dict[str, PageResult]:
+    return {
+        ROOT: result("/admin", "/admin/users", "/administrators", "/about", "/q.pdf"),
+        "http://example.com/admin": result("/secret"),
+        "http://example.com/admin/users": result(),
+        "http://example.com/administrators": result(),
+        "http://example.com/about": result(),
+        "http://example.com/q.pdf": result("/deep"),
+        "http://example.com/secret": result(),
+        "http://example.com/deep": result(),
+    }
+
+
+def test_a_skipped_path_is_never_visited(tmp_path: Path) -> None:
+    crawl(ROOT, tmp_path, 100, skip=["/admin"], renderer=FakeRenderer(mixed_site()))
+
+    captured = set(nodes_by_url(tmp_path))
+    assert "http://example.com/admin" not in captured
+    assert "http://example.com/admin/users" not in captured
+    # ...and neither is anything only reachable through it.
+    assert "http://example.com/secret" not in captured
+
+
+def test_skipping_leaves_the_neighbours_alone(tmp_path: Path) -> None:
+    """The whole reason the literal ends on a segment edge."""
+    crawl(ROOT, tmp_path, 100, skip=["/admin"], renderer=FakeRenderer(mixed_site()))
+
+    captured = set(nodes_by_url(tmp_path))
+    assert "http://example.com/administrators" in captured
+    assert "http://example.com/about" in captured
+
+
+def test_a_skipped_page_is_still_recorded_as_a_link(tmp_path: Path) -> None:
+    """The page was never captured, but the page that pointed at it did point
+    at it, and the record has to keep saying so — that is what shows up as
+    "not crawled" rather than as a link that vanished."""
+    crawl(ROOT, tmp_path, 100, skip=["/admin"], renderer=FakeRenderer(mixed_site()))
+
+    record = json.loads((tmp_path / PAGES_DIR / "000001.json").read_text())
+    assert "http://example.com/admin" in record["links"]
+    assert "http://example.com/admin/users" in record["links"]
+
+
+def test_a_regex_skips_what_a_path_cannot(tmp_path: Path) -> None:
+    crawl(
+        ROOT,
+        tmp_path,
+        100,
+        skip=[r"re:\.pdf$"],
+        renderer=FakeRenderer(mixed_site()),
+    )
+
+    captured = set(nodes_by_url(tmp_path))
+    assert "http://example.com/q.pdf" not in captured
+    assert "http://example.com/deep" not in captured, "its only link was the pdf"
+    assert "http://example.com/admin" in captured
+
+
+def test_several_patterns_are_a_union(tmp_path: Path) -> None:
+    crawl(
+        ROOT,
+        tmp_path,
+        100,
+        skip=["/admin", r"re:\.pdf$"],
+        renderer=FakeRenderer(mixed_site()),
+    )
+
+    captured = set(nodes_by_url(tmp_path))
+    assert "http://example.com/admin" not in captured
+    assert "http://example.com/q.pdf" not in captured
+    assert "http://example.com/about" in captured
+
+
+def test_a_skip_reports_what_it_left_out(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    crawl(ROOT, tmp_path, 100, skip=["/admin"], renderer=FakeRenderer(mixed_site()))
+
+    out = capsys.readouterr().out
+    assert "skipped by --skip" in out
+    assert "uncaptured links" in out
+
+
+def test_a_skip_does_not_use_up_a_pattern_allowance(tmp_path: Path) -> None:
+    """A page nobody is going to capture should not count against the route it
+    happens to share with pages that will be."""
+    pages = {
+        ROOT: result("/courses/1", "/courses/2", "/skipme/1"),
+        "http://example.com/courses/1": result(),
+        "http://example.com/courses/2": result(),
+        "http://example.com/skipme/1": result(),
+    }
+    crawl(
+        ROOT,
+        tmp_path,
+        100,
+        per_pattern=1,
+        skip=["/skipme"],
+        renderer=FakeRenderer(pages),
+    )
+
+    captured = set(nodes_by_url(tmp_path))
+    assert "http://example.com/courses/1" in captured
+    assert "http://example.com/skipme/1" not in captured
+
+
+def test_a_skip_that_would_skip_the_start_url_is_refused(tmp_path: Path) -> None:
+    """An empty crawl should not need reading the output to notice."""
+    with pytest.raises(ValueError) as excinfo:
+        crawl(ROOT, tmp_path, 10, skip=["/"], renderer=FakeRenderer({}))
+
+    assert "start URL" in str(excinfo.value)
+    assert not (tmp_path / GRAPH_FILE).exists()
+
+
+def test_skipping_nothing_is_the_same_as_not_asking(tmp_path: Path) -> None:
+    with_skip = tmp_path / "a"
+    without = tmp_path / "b"
+    crawl(ROOT, with_skip, 100, skip=[], renderer=FakeRenderer(mixed_site()))
+    crawl(ROOT, without, 100, renderer=FakeRenderer(mixed_site()))
+
+    assert set(nodes_by_url(with_skip)) == set(nodes_by_url(without))
+
+
 # --- input validation ---------------------------------------------------
 
 

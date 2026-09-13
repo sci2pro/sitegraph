@@ -37,8 +37,12 @@ const REPULSION_NODE_SCALE = 40;
 const LAYOUT_MARGIN = CARD_W;
 
 const state = {
-  nodes: [],
-  byId: new Map(),
+  nodes: [], // the drawn nodes: one per route, see foldByShape
+  all: [], // every crawled page, folded or not
+  byId: new Map(), // id -> node, for *every* page
+  idByUrl: new Map(), // url -> id, for every page
+  repOf: new Map(), // id -> the id of the route it belongs to
+  instances: new Map(), // representative id -> every member node
   edges: [],
   edgeEls: [],
   nodeEls: new Map(),
@@ -88,12 +92,29 @@ function titleOf(node) {
   return node.title && node.title.trim() ? node.title.trim() : "";
 }
 
+/** How many pages a drawn node stands for, when it stands for more than one. */
+function countBadge(node) {
+  const total = node.instances ? node.instances.length : 1;
+  if (total < 2) return null;
+  return el("span", {
+    class: "count",
+    text: `×${total}`,
+    title: `${total} pages of this route were crawled`,
+  });
+}
+
+/** Whether a drawn node matches the filter.
+ *
+ * Its members count, not just the representative: filtering for the page you
+ * came to see should not hide the route it lives on.
+ */
 function matches(node) {
   if (!state.filter) return true;
   const needle = state.filter.toLowerCase();
-  return (
-    node.url.toLowerCase().includes(needle) ||
-    (node.title || "").toLowerCase().includes(needle)
+  return (node.instances || [node]).some(
+    (member) =>
+      member.url.toLowerCase().includes(needle) ||
+      (member.title || "").toLowerCase().includes(needle)
   );
 }
 
@@ -153,11 +174,13 @@ async function init() {
     return;
   }
 
-  state.nodes = graph.nodes || [];
-  state.edges = (graph.edges || []).filter(
-    (edge) => edge && edge.source !== edge.target
-  );
-  for (const node of state.nodes) state.byId.set(node.id, node);
+  state.all = graph.nodes || [];
+  for (const node of state.all) {
+    state.byId.set(node.id, node);
+    state.idByUrl.set(node.url, node.id);
+  }
+  foldByShape();
+  state.edges = foldEdges(graph.edges || []);
 
   const root = state.byId.get(graph.root);
   $("root-label").textContent = root ? pathOf(root.url) : "";
@@ -182,6 +205,67 @@ async function init() {
   select(rootNode.id, { center: false });
   await settle();
   fit(); // frame the relaxed layout, not the spiral seed
+}
+
+/** Collapse every route's instances into one drawn node.
+ *
+ * A page that is one instance of `/courses/:id` is not interesting five
+ * hundred times over, and drawing them all makes the graph's complexity track
+ * the app's *rows* rather than its *routes* — which is the opposite of what
+ * the graph is for. Only the drawn list folds: `byId` keeps every page, so the
+ * inspector can still open any instance and the links between pages still
+ * resolve.
+ *
+ * Folding here rather than at each use is what keeps the rest of this file
+ * unchanged — positions, cards, edges and selection are all keyed by node id
+ * and carry on as they were.
+ */
+function foldByShape() {
+  const routes = new Map(); // shape -> members, in id order
+  for (const node of state.all) {
+    const key = node.shape || node.url;
+    if (!routes.has(key)) routes.set(key, []);
+    routes.get(key).push(node);
+  }
+
+  state.nodes = [];
+  for (const [key, members] of routes) {
+    // The first member that actually rendered, so a route does not look broken
+    // because instance one happened to 404.
+    const representative = members.find((node) => !node.failed) || members[0];
+    representative.shape = key;
+    representative.instances = members;
+    state.instances.set(representative.id, members);
+    for (const member of members) state.repOf.set(member.id, representative.id);
+    state.nodes.push(representative);
+  }
+}
+
+/** Move the edges onto the routes, dropping what only relates a route to itself.
+ *
+ * This is where the graph stops being "every link between every page" and
+ * becomes "how the routes relate", which is the whole point: otherwise the
+ * edges multiply by the instance count too.
+ */
+function foldEdges(edges) {
+  const seen = new Set();
+  const folded = [];
+  for (const edge of edges) {
+    if (!edge) continue;
+    const source = state.repOf.get(edge.source);
+    const target = state.repOf.get(edge.target);
+    if (!source || !target || source === target) continue;
+    const key = `${source}->${target}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    folded.push({ source, target });
+  }
+  return folded;
+}
+
+/** The route a node belongs to — itself, for a page with no identifier in it. */
+function routeOf(id) {
+  return state.repOf.get(id) || id;
 }
 
 function buildLayout() {
@@ -372,11 +456,18 @@ function renderGraph() {
       el(
         "div",
         { class: "meta" },
-        el("div", {
-          class: "title",
-          text: titleOf(node) || pathOf(node.url),
-        }),
-        el("div", { class: "path", text: pathOf(node.url) })
+        el(
+          "div",
+          { class: "title" },
+          el("span", {
+            class: "label",
+            text: titleOf(node) || pathOf(node.url),
+          }),
+          countBadge(node)
+        ),
+        // The *shape*, not the representative's own path: `/courses/1` would
+        // misdescribe the four hundred others standing behind this card.
+        el("div", { class: "path", text: pathOf(node.shape) })
       )
     );
     card.style.marginLeft = `${-CARD_W / 2}px`;
@@ -473,8 +564,16 @@ function renderSheet() {
       el(
         "div",
         { class: "meta" },
-        el("div", { class: "title", text: titleOf(node) || pathOf(node.url) }),
-        el("div", { class: "path", text: pathOf(node.url) })
+        el(
+          "div",
+          { class: "title" },
+          el("span", {
+            class: "label",
+            text: titleOf(node) || pathOf(node.url),
+          }),
+          countBadge(node)
+        ),
+        el("div", { class: "path", text: pathOf(node.shape) })
       )
     );
     tile.addEventListener("click", () => select(node.id, { center: true }));
@@ -570,14 +669,17 @@ function select(id, options = {}) {
   if (!state.byId.has(id)) return;
   state.selected = id;
 
+  // A folded instance selects its route — that is the card on screen — while
+  // the inspector still opens the page that was actually asked for.
+  const drawn = routeOf(id);
   for (const [otherId, card] of state.nodeEls) {
-    card.classList.toggle("selected", otherId === id);
+    card.classList.toggle("selected", otherId === drawn);
   }
   for (const tile of document.querySelectorAll(".tile")) {
-    tile.classList.toggle("selected", tile.dataset.id === id);
+    tile.classList.toggle("selected", tile.dataset.id === drawn);
   }
-  highlightEdges(id);
-  if (options.center) centreOn(id);
+  highlightEdges(drawn);
+  if (options.center) centreOn(drawn);
   openInspector(id);
 }
 
@@ -675,22 +777,96 @@ async function openInspector(id) {
     el("span", { class: "chip", text: `depth ${node.depth}` }),
     el("span", { class: "chip", text: node.id })
   );
+  if (node.shape && node.shape !== node.url) {
+    chips.append(
+      el("span", {
+        class: "chip",
+        text: pathOf(node.shape),
+        title: "the route this page is one instance of",
+      })
+    );
+  }
   body.append(chips);
 
   if (node.failed && node.error) {
     body.append(el("div", { class: "links none", text: node.error }));
   }
 
+  const instances = instanceSection(node);
+  if (instances) body.append(instances);
+
   // Both sections take URLs, not IDs: the outgoing list comes from the page
   // record (which stores absolute URLs) and the incoming list is derived from
   // the edges, so the edge's ID has to be resolved back to its URL first.
+  //
+  // Outgoing is this *page*'s links, which is what its record holds. Incoming
+  // is this page's *route* being linked to, because that is the level the
+  // edges were folded to — a route is a more useful answer than one arbitrary
+  // instance of it.
   const incoming = state.edges
-    .filter((edge) => edge.target === id)
+    .filter((edge) => edge.target === routeOf(id))
     .map((edge) => state.byId.get(edge.source)?.url)
     .filter(Boolean);
 
   body.append(linkSection("out", "Outgoing", await outgoingTargets(node)));
   body.append(linkSection("in", "Incoming", incoming));
+}
+
+/** How many instances of a route the inspector will list before summarising. */
+const INSTANCES_SHOWN = 40;
+
+/** The pages standing behind one drawn node, so a folded page stays reachable. */
+function instanceSection(node) {
+  const members = state.instances.get(routeOf(node.id));
+  if (!members || members.length < 2) return null;
+
+  const section = el(
+    "div",
+    { class: "insp-section instances" },
+    el(
+      "h3",
+      {},
+      el("span", { class: "swatch" }),
+      `Instances (${members.length})`
+    )
+  );
+  const list = el("ul", { class: "links" });
+
+  for (const member of members.slice(0, INSTANCES_SHOWN)) {
+    list.append(
+      el(
+        "li",
+        {},
+        el(
+          "button",
+          {
+            type: "button",
+            class: member.id === node.id ? "current" : "",
+            title: member.url,
+            onclick: () => select(member.id, { center: false }),
+          },
+          el("div", { class: "path", text: pathOf(member.url) }),
+          el("div", {
+            class: "sub",
+            text: member.failed
+              ? "failed to render"
+              : [member.status, titleOf(member)].filter(Boolean).join(" · "),
+          })
+        )
+      )
+    );
+  }
+  section.append(list);
+
+  if (members.length > INSTANCES_SHOWN) {
+    section.append(
+      el("div", {
+        class: "links none",
+        text: `…and ${members.length - INSTANCES_SHOWN} more`,
+      })
+    );
+  }
+  return section;
 }
 
 /** The page record's full link list; the graph's edges if it is unavailable. */
@@ -761,8 +937,9 @@ function linkSection(direction, label, targets) {
 }
 
 function idForUrl(url) {
-  for (const node of state.nodes) if (node.url === url) return node.id;
-  return null;
+  // Every page, not just the drawn ones — a folded instance is still a real
+  // page, and reporting it as "not crawled" would be a lie.
+  return state.idByUrl.get(url) ?? null;
 }
 
 /* --------------------------------------------------------------- filtering */
@@ -781,13 +958,16 @@ function applyFilter() {
 }
 
 function updateCounts() {
-  const total = state.nodes.length;
-  if (!state.filter) {
-    $("counts").textContent = `${total} pages · ${state.edges.length} links`;
-    return;
-  }
-  const shown = state.nodes.filter(matches).length;
-  $("counts").textContent = `${shown} / ${total} pages`;
+  const routes = state.nodes.length;
+  const pages = state.all.length;
+  const shown = state.filter ? state.nodes.filter(matches).length : routes;
+
+  const parts = [`${shown === routes ? routes : `${shown} / ${routes}`} routes`];
+  // Only worth saying when the two differ — which is exactly when folding did
+  // something, and is the number that used to be the whole graph.
+  if (pages !== routes) parts.push(`${pages} pages`);
+  parts.push(`${state.edges.length} links`);
+  $("counts").textContent = parts.join(" · ");
 }
 
 function setView(name) {
