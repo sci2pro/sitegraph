@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>sitegraph</title>
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <span class="brand">sitegraph</span>
+      <span class="root" id="root-label"></span>
+
+      <nav class="views" role="tablist" aria-label="View">
+        <button id="tab-graph" class="tab is-active" role="tab" aria-selected="true">
+          Graph
+        </button>
+        <button id="tab-sheet" class="tab" role="tab" aria-selected="false">
+          Contact sheet
+        </button>
+      </nav>
+
+      <input
+        id="filter"
+        type="search"
+        placeholder="Filter pages…"
+        autocomplete="off"
+        aria-label="Filter pages by title or path"
+      />
+      <span class="counts" id="counts"></span>
+    </header>
+
+    <main>
+      <section id="graph-view" class="view" aria-label="Graph view">
+        <div id="stage">
+          <!-- #world is a fixed-size canvas with its origin at the centre, so
+               edges need no coordinate rebasing: the transform that pans and
+               zooms #world moves the SVG and the node cards identically. -->
+          <div id="world">
+            <svg id="edges" width="12000" height="12000"></svg>
+            <div id="nodes"></div>
+          </div>
+
+          <div class="hud" id="hints">
+            Drag to pan · Scroll to zoom · Click a page to inspect
+          </div>
+          <div class="hud buttons" id="controls">
+            <button data-zoom="in" title="Zoom in (+)">+</button>
+            <button data-zoom="out" title="Zoom out (−)">−</button>
+            <button data-zoom="reset" title="Reset view (0)">Reset</button>
+          </div>
+        </div>
+        <div id="empty" class="empty" hidden></div>
+      </section>
+
+      <section id="sheet-view" class="view" aria-label="Contact sheet" hidden>
+        <div id="grid"></div>
+      </section>
+    </main>
+
+    <aside id="inspector" aria-label="Page inspector" hidden></aside>
+
+    <script src="app.js"></script>
+  </body>
+</html>

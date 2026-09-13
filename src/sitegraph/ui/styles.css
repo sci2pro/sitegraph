@@ -1,0 +1,611 @@
+/* sitegraph explorer.
+   Dark by default — a graph of screenshots reads better against a neutral
+   dark field, and this is a tool a developer keeps open next to an editor. */
+
+:root {
+  --bg: #14161a;
+  --panel: #1b1e24;
+  --panel-2: #22262e;
+  --line: #2e333d;
+  --text: #e6e9ef;
+  --muted: #9aa3b2;
+  --faint: #6b7484;
+  --accent: #6aa9ff;
+  --out: #6aa9ff;
+  --in: #ffb86b;
+  --bad: #ff6b6b;
+  --ok: #58d68d;
+  --radius: 10px;
+  --inspector-w: 380px;
+  --card-w: 168px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+/* A class that sets `display` beats the UA stylesheet's `[hidden]` rule, which
+   silently leaves "hidden" overlays in the layout swallowing clicks. Every
+   `hidden` element in this UI means it: hide it, whatever its display is. */
+[hidden] {
+  display: none !important;
+}
+
+html,
+body {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font: 13px/1.45 ui-sans-serif, -apple-system, "Segoe UI", Roboto, sans-serif;
+  overflow: hidden;
+}
+
+/* ---------- top bar ---------- */
+
+.topbar {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  height: 48px;
+  padding: 0 14px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+  position: relative;
+  z-index: 3;
+}
+
+.brand {
+  font-weight: 650;
+  letter-spacing: 0.2px;
+}
+
+.root {
+  color: var(--faint);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  max-width: 30ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  direction: rtl; /* keep the origin visible when the URL is long */
+  text-align: left;
+}
+
+.views {
+  display: flex;
+  gap: 2px;
+  margin-left: auto;
+  background: var(--bg);
+  padding: 2px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.tab {
+  background: none;
+  border: 0;
+  color: var(--muted);
+  padding: 4px 12px;
+  border-radius: 6px;
+  cursor: pointer;
+  font: inherit;
+}
+
+.tab.is-active {
+  background: var(--panel-2);
+  color: var(--text);
+}
+
+#filter {
+  width: 200px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--text);
+  padding: 5px 10px;
+  font: inherit;
+}
+
+#filter:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.counts {
+  color: var(--faint);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+/* ---------- layout ---------- */
+
+main {
+  position: absolute;
+  inset: 48px 0 0 0;
+  transition: right 0.16s ease;
+}
+
+body.inspecting main {
+  right: var(--inspector-w);
+}
+
+.view {
+  position: absolute;
+  inset: 0;
+}
+
+/* ---------- graph view ---------- */
+
+#stage {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  cursor: grab;
+  contain: strict;
+}
+
+#stage.panning {
+  cursor: grabbing;
+}
+
+#world {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 12000px;
+  height: 12000px;
+  transform-origin: 0 0;
+  will-change: transform;
+}
+
+#edges {
+  position: absolute;
+  top: 0;
+  left: 0;
+  overflow: visible;
+  pointer-events: none;
+}
+
+.edge {
+  stroke: var(--line);
+  stroke-width: 1.5;
+  fill: none;
+}
+
+/* Highlighting follows direction: what the selected page links *to* reads in
+   the accent colour, what links *to it* in the second colour. */
+.edge.out {
+  stroke: var(--out);
+  stroke-width: 2.5;
+}
+
+.edge.in {
+  stroke: var(--in);
+  stroke-width: 2.5;
+}
+
+.edge.faded {
+  opacity: 0.15;
+}
+
+.node {
+  position: absolute;
+  width: var(--card-w);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  overflow: hidden;
+  cursor: pointer;
+  user-select: none;
+  box-shadow: 0 2px 10px rgb(0 0 0 / 35%);
+}
+
+.node:hover {
+  border-color: var(--faint);
+}
+
+.node.selected {
+  border-color: var(--accent);
+  box-shadow:
+    0 0 0 2px rgb(106 169 255 / 35%),
+    0 4px 18px rgb(0 0 0 / 45%);
+}
+
+.node.dim {
+  opacity: 0.12;
+  pointer-events: none;
+}
+
+/* The root is the anchor of the whole graph, so it is marked explicitly. */
+.node.root .thumb::after {
+  content: "root";
+  position: absolute;
+  top: 6px;
+  left: 6px;
+  background: rgb(20 22 26 / 85%);
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  border-radius: 999px;
+  padding: 1px 7px;
+  font-size: 10px;
+  letter-spacing: 0.3px;
+}
+
+.thumb {
+  position: relative;
+  height: 105px; /* 168px at the 1440x900 viewport's 16:10 */
+  background: var(--panel-2);
+  border-bottom: 1px solid var(--line);
+}
+
+.thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  object-position: top left;
+  display: block;
+}
+
+.node .meta {
+  padding: 6px 8px 7px;
+}
+
+.node .title {
+  font-weight: 550;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.node .path {
+  color: var(--faint);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Failed pages keep their place in the graph — spec §7 — so the placeholder
+   has to read as "captured, but empty" rather than looking like a bug. */
+.shot-missing {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  color: var(--faint);
+  font-size: 11px;
+  background: repeating-linear-gradient(
+    -45deg,
+    var(--panel-2),
+    var(--panel-2) 6px,
+    #1d2027 6px,
+    #1d2027 12px
+  );
+}
+
+.node.failed .title::after {
+  content: "failed";
+  float: right;
+  color: var(--bad);
+  font-size: 10px;
+  font-weight: 500;
+}
+
+.hud {
+  position: absolute;
+  color: var(--faint);
+  font-size: 11.5px;
+  pointer-events: none;
+  user-select: none;
+}
+
+#hints {
+  left: 14px;
+  bottom: 12px;
+}
+
+.hud.buttons {
+  right: 14px;
+  bottom: 12px;
+  display: flex;
+  gap: 4px;
+  pointer-events: auto;
+}
+
+.hud.buttons button {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  color: var(--muted);
+  border-radius: 7px;
+  width: 28px;
+  height: 26px;
+  cursor: pointer;
+  font: inherit;
+}
+
+.hud.buttons button:last-child {
+  width: auto;
+  padding: 0 9px;
+}
+
+.hud.buttons button:hover {
+  color: var(--text);
+  border-color: var(--faint);
+}
+
+.empty {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--muted);
+  text-align: center;
+  padding: 40px;
+}
+
+.empty code {
+  color: var(--text);
+  background: var(--panel-2);
+  border-radius: 5px;
+  padding: 2px 6px;
+}
+
+/* ---------- contact sheet ---------- */
+
+#sheet-view {
+  overflow: auto;
+  padding: 18px 18px 40px;
+}
+
+#grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 14px;
+}
+
+.tile {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  overflow: hidden;
+  cursor: pointer;
+  text-align: left;
+  padding: 0;
+  color: inherit;
+  font: inherit;
+}
+
+.tile:hover {
+  border-color: var(--faint);
+}
+
+.tile.selected {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px rgb(106 169 255 / 35%);
+}
+
+.tile .thumb {
+  height: 125px;
+}
+
+.tile .meta {
+  padding: 8px 10px 9px;
+}
+
+.tile .title {
+  font-weight: 550;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tile .path {
+  color: var(--faint);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ---------- inspector ---------- */
+
+#inspector {
+  position: fixed;
+  top: 48px;
+  right: 0;
+  bottom: 0;
+  width: var(--inspector-w);
+  background: var(--panel);
+  border-left: 1px solid var(--line);
+  overflow-y: auto;
+  z-index: 2;
+}
+
+.insp-head {
+  position: relative;
+  border-bottom: 1px solid var(--line);
+}
+
+.insp-shot {
+  width: 100%;
+  height: 213px; /* 380px at 16:10 */
+  background: var(--panel-2);
+  border-bottom: 1px solid var(--line);
+}
+
+.insp-shot img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  object-position: top left;
+  display: block;
+}
+
+.insp-body {
+  padding: 12px 14px 20px;
+}
+
+.insp-body h2 {
+  margin: 0 0 4px;
+  font-size: 15px;
+  font-weight: 600;
+  word-break: break-word;
+}
+
+.insp-body h2.untitled {
+  color: var(--faint);
+  font-style: italic;
+}
+
+.insp-body .url {
+  color: var(--accent);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11.5px;
+  word-break: break-all;
+  text-decoration: none;
+}
+
+.insp-body .url:hover {
+  text-decoration: underline;
+}
+
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin: 10px 0 2px;
+}
+
+.chip {
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 2px 9px;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.chip.ok {
+  color: var(--ok);
+}
+
+.chip.bad {
+  color: var(--bad);
+}
+
+.insp-close {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  width: 26px;
+  height: 26px;
+  border-radius: 7px;
+  border: 1px solid var(--line);
+  background: rgb(20 22 26 / 80%);
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 15px;
+  line-height: 1;
+}
+
+.insp-close:hover {
+  color: var(--text);
+}
+
+.insp-section {
+  border-top: 1px solid var(--line);
+  padding: 12px 14px;
+}
+
+.insp-section h3 {
+  margin: 0 0 8px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  color: var(--muted);
+  display: flex;
+  gap: 7px;
+  align-items: center;
+}
+
+.insp-section h3 .swatch {
+  width: 9px;
+  height: 9px;
+  border-radius: 3px;
+  background: var(--faint);
+}
+
+.insp-section.out h3 .swatch {
+  background: var(--out);
+}
+
+.insp-section.in h3 .swatch {
+  background: var(--in);
+}
+
+.links {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.links button {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  color: var(--text);
+  cursor: pointer;
+  padding: 5px 7px;
+  font: inherit;
+}
+
+.links button:hover {
+  background: var(--panel-2);
+  border-color: var(--line);
+}
+
+.links .path {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  word-break: break-all;
+}
+
+.links .sub {
+  color: var(--faint);
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.links .none {
+  color: var(--faint);
+  font-size: 12px;
+  font-style: italic;
+}
+
+/* A link whose target was never crawled (cut off by --max-pages) is real data
+   from the page record, but has nothing to open — so it is listed plainly. */
+.links li.uncrawled {
+  color: var(--faint);
+  padding: 5px 7px;
+  border: 1px dashed var(--line);
+  border-radius: 7px;
+}
+
+.links li.uncrawled .why {
+  font-size: 11px;
+}

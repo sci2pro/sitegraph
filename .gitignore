@@ -1,0 +1,25 @@
+# Crawl output
+.sitegraph/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Local secrets and environment overrides
+claude_env.sh
+.env
+
+# macOS
+.DS_Store

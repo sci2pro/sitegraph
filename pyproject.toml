@@ -1,0 +1,33 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "sitegraph"
+description = "Local-first CLI for crawling a web application and exploring its structure as a graph."
+requires-python = ">=3.13"
+dependencies = [
+    "playwright>=1.62.0",
+]
+dynamic = ["version"]
+
+[project.scripts]
+sitegraph = "sitegraph.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
+
+[tool.hatch.version]
+source = "code"
+path = "src/sitegraph/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sitegraph"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "e2e: drives a real browser (deselect with -m 'not e2e')",
+]
