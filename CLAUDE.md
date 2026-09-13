@@ -111,12 +111,33 @@ The consequences of commit-time allocation are worth knowing:
   nothing is overshot — but the cut line moves. Use `--workers 1` when a capped
   crawl needs to be reproducible.
 
-**A signed-in crawl is one worker, always.** Browsers do not share a cookie
-jar, so a session that rotates mid-crawl would leave every other worker logged
-out and their pages recorded as the login page under their real URLs. Passing
-`--workers > 1` with `--storage-state` is refused rather than warned about; the
-automatic count comes out at 1 so the common case — crawling your own app
-behind a login — just works.
+**A signed-in crawl's workers share one session.** Playwright's sync API gives
+no way to hand two threads one browser context, so each worker has a cookie jar
+of its own — and a site that rotates its session cookie would leave all but the
+first holding a dead token, which is answered with a redirect to the login page.
+`crawl.py::SharedSession` keeps them in step: a worker takes the latest cookies
+before it loads a page and offers back what it ended up with afterwards.
+
+Two things about it are load-bearing and easy to undo by accident:
+
+- **The offer is a compare-and-swap, not a write.** A worker spends a page load
+  between reading the session and writing it back, so a *slow* page's older
+  token would land on top of a fast page's newer one. Publishing only when the
+  version has not moved makes the pool move strictly forwards. Without it, a
+  pooled crawl of a rotating site intermittently captures the login page —
+  which is how the flaw was found, as a test that failed one run in two.
+- **A worker shares the moment the response lands**, before the network-idle
+  settle, for the same reason: the later the share, the staler it is.
+
+Measured against a fixture that rolls its session over every third request:
+15/15 pages captured correctly at four workers, and the same at one — 3.3s
+against 9.5s. With the sharing disabled the same crawl records the login page
+under page URLs, which is what `tests/test_login.py` pins.
+
+Cookies only. An app that rotates a token in `localStorage` is not covered, and
+two workers presenting the same token in the same instant can still race a
+server that invalidates on first use — inherent to fetching concurrently at
+all, and a browser with two tabs has it too.
 
 Shutdown is `_RenderPool.stop_and_join`: sentinels stop the workers, a short
 grace lets any visit already in flight finish, and a worker still wedged after

@@ -24,7 +24,7 @@ from pathlib import Path
 import pytest
 from test_crawl import ROOT, WEBP_MAGIC, FakeRenderer, nodes_by_url, read_graph, result
 
-from sitegraph.crawl import PageResult, crawl
+from sitegraph.crawl import PageResult, SharedSession, crawl
 from sitegraph.store import GRAPH_FILE, INCOMING_DIR, PAGES_DIR, SCREENSHOTS_DIR
 
 A = "http://example.com/a"
@@ -442,34 +442,83 @@ def test_one_renderer_cannot_serve_several_workers(tmp_path: Path) -> None:
         crawl(ROOT, tmp_path, 10, workers=4, renderer=FakeRenderer({}))
 
 
-def test_a_signed_in_crawl_is_limited_to_one_worker(tmp_path: Path) -> None:
-    """Separate browsers have separate cookie jars, so a session that rotates
-    mid-crawl would leave the workers behind it logged out."""
-    session = tmp_path / "session.json"
-    session.write_text("{}", encoding="utf-8")
-
-    with pytest.raises(ValueError, match="signed-in"):
-        crawl(ROOT, tmp_path, 10, workers=4, storage_state=session)
-
-
-def test_a_signed_in_crawl_defaults_to_one_worker(tmp_path: Path) -> None:
-    """Crawling your own app behind a login is the common case, so a session
-    must not be refused by the automatic pool size — it just gets one worker,
-    and only an explicit --workers asks for more."""
+def test_a_signed_in_crawl_may_use_a_pool(tmp_path: Path) -> None:
+    """It used to be refused, because browsers do not share a cookie jar. They
+    still do not — `SharedSession` keeps them in step instead, so the
+    combination is allowed rather than blocked."""
     session = tmp_path / "session.json"
     session.write_text(json.dumps({"cookies": [], "origins": []}), encoding="utf-8")
-    pages = {ROOT: result("/a"), A: result()}
+    pages = {ROOT: result("/a", "/b"), A: result(), B: result()}
     recorder = Recorder()
 
-    # No `workers=`: the default has to come out at one on a loopback host,
-    # which is exactly where the automatic count would otherwise be four.
     crawl(
         ROOT,
         tmp_path,
         10,
+        workers=3,
         storage_state=session,
         renderer_factory=factory(pages, recorder),
     )
 
-    assert set(nodes_by_url(tmp_path)) == {ROOT, A}
-    assert recorder.max_active == 1, "a signed-in crawl must not run a pool"
+    assert set(nodes_by_url(tmp_path)) == {ROOT, A, B}
+    assert recorder.opened == 3, "a signed-in crawl should get its pool"
+
+
+# --- the session the workers share --------------------------------------
+
+
+def cookie(value: str) -> dict:
+    return {"name": "sid", "domain": "example.com", "path": "/", "value": value}
+
+
+def test_a_shared_session_reports_a_rotation() -> None:
+    session = SharedSession()
+    session.seed([cookie("t1")])
+    _, version = session.adopt()
+
+    assert session.observe([cookie("t1")], version) is False, "nothing changed"
+    assert session.rotations == 0
+
+    _, version = session.adopt()
+    assert session.observe([cookie("t2")], version) is True
+    assert session.rotations == 1
+    assert session.adopt()[0][0]["value"] == "t2"
+
+
+def test_a_stale_report_cannot_overwrite_a_newer_one() -> None:
+    """The bug the version check exists for. Two workers load pages from the
+    same token, both come back with a new one, and the slower of the two
+    publishes last — which without the check would send the whole pool back to
+    a token the first of them already spent."""
+    session = SharedSession()
+    session.seed([cookie("t1")])
+    _, first = session.adopt()
+    _, second = session.adopt()  # both workers read t1
+
+    assert session.observe([cookie("t2")], first) is True
+    assert session.observe([cookie("t3")], second) is False, "stale offer accepted"
+
+    assert session.adopt()[0][0]["value"] == "t2"
+
+
+def test_a_shared_session_ignores_field_noise_and_order() -> None:
+    """What a browser fills in for itself is not part of the session, so a set
+    that came back with different flags is not a rotation."""
+    session = SharedSession()
+    session.seed([cookie("t1")])
+    _, version = session.adopt()
+
+    same = [{"path": "/", "domain": "example.com", "name": "sid", "value": "t1",
+             "httpOnly": True, "secure": False, "sameSite": "Lax"}]
+    assert session.observe(same, version) is False
+    assert session.rotations == 0
+
+
+def test_an_adopted_session_is_a_copy() -> None:
+    session = SharedSession()
+    session.seed([cookie("t1")])
+
+    got, _ = session.adopt()
+    got[0]["value"] = "tampered"
+
+    assert session.adopt()[0][0]["value"] == "t1"

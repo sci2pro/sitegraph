@@ -126,28 +126,27 @@ def test_crawl_rejects_an_impossible_worker_count(value: str) -> None:
         build_parser().parse_args(["crawl", "http://x/", "--workers", value])
 
 
-def test_crawl_refuses_a_pool_for_a_signed_in_crawl(tmp_path: Path) -> None:
+def test_crawl_accepts_a_pool_for_a_signed_in_crawl(tmp_path: Path) -> None:
+    """The combination used to be refused outright; the workers share one
+    session now, so it is a normal crawl. The assertion is only that the flags
+    parse and are not rejected — the sharing itself is tested against a server
+    that rotates its cookie, in test_login.py."""
     session = tmp_path / "session.json"
     session.write_text("{}", encoding="utf-8")
 
-    with pytest.raises(SystemExit) as excinfo:
-        main(
-            [
-                "crawl",
-                "http://localhost:3000",
-                "--output",
-                str(tmp_path / "out"),
-                "--storage-state",
-                str(session),
-                "--workers",
-                "4",
-            ]
-        )
+    args = build_parser().parse_args(
+        [
+            "crawl",
+            "http://localhost:3000",
+            "--storage-state",
+            str(session),
+            "--workers",
+            "4",
+        ]
+    )
 
-    message = str(excinfo.value)
-    assert "signed-in" in message
-    assert "drop --workers" in message
-    assert not (tmp_path / "out").exists()
+    assert args.workers == 4
+    assert args.storage_state == str(session)
 
 
 def test_crawl_accepts_resume() -> None:

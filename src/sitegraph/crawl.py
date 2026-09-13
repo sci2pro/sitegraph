@@ -25,7 +25,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from queue import Empty, Queue
-from threading import Thread
+from threading import Lock, Thread
 from typing import Protocol, Self
 from urllib.parse import urlsplit
 
@@ -55,6 +55,7 @@ __all__ = [
     "PageResult",
     "Renderer",
     "ResumeError",
+    "SharedSession",
     "ResumeState",
     "crawl",
     "resume_state",
@@ -147,6 +148,80 @@ def _first_line(exc: Exception) -> str:
     return text.splitlines()[0] if text else exc.__class__.__name__
 
 
+class SharedSession:
+    """One signed-in session, kept in step across the workers' cookie jars.
+
+    Playwright's sync API offers no way to give two threads one browser
+    context, so each worker has a jar of its own. That is fine until the site
+    rotates its session cookie: the worker that made the request holds the new
+    token and every other worker is left holding a dead one, which a real app
+    answers by redirecting to the login page — so the crawl quietly records the
+    login page under the URL it actually wanted.
+
+    This is the fix: a worker takes the latest cookies before it loads a page
+    and reports back whatever it ended up with afterwards, so a rotation made
+    by any worker reaches the others before their next page.
+
+    Two limits, both worth knowing. Cookies only — an app that rotates a token
+    in ``localStorage`` is not covered. And two workers presenting the same
+    token in the same instant can still race a server that invalidates a token
+    the moment it is used; that one is inherent to fetching pages concurrently
+    at all, and a browser with two tabs has it too.
+    """
+
+    def __init__(self) -> None:
+        self._lock = Lock()
+        self._cookies: list[dict] = []
+        self._version = 0
+        self.rotations = 0
+
+    def seed(self, cookies: list[dict]) -> None:
+        """Start from a known session, e.g. one taken from a saved state."""
+        with self._lock:
+            self._cookies = [dict(cookie) for cookie in cookies]
+            self._version += 1
+
+    def adopt(self) -> tuple[list[dict], int]:
+        """The cookies to load a page with, and the version they came from."""
+        with self._lock:
+            return [dict(cookie) for cookie in self._cookies], self._version
+
+    def observe(self, cookies: list[dict], from_version: int) -> bool:
+        """Offer *cookies* back; report whether they were taken up.
+
+        Only accepted if the session has not moved since the caller read it. A
+        worker spends a page load between reading and writing, so without that
+        check a slow page's *older* token would land on top of a fast page's
+        newer one and send the whole pool back to a token the server has
+        already retired — which is exactly the failure this class exists to
+        prevent, arriving by a different route.
+        """
+        with self._lock:
+            if from_version != self._version:
+                # Someone published while this worker was loading its page.
+                # Theirs is the later word; this one is stale on arrival.
+                return False
+            if _fingerprint(self._cookies) == _fingerprint(cookies):
+                return False
+            self._cookies = [dict(cookie) for cookie in cookies]
+            self._version += 1
+            self.rotations += 1
+            return True
+
+
+def _fingerprint(cookies: list[dict]) -> set[tuple]:
+    """The parts of a cookie that make it *this* session rather than another.
+
+    Order is not part of it, and neither are the fields a browser fills in for
+    itself, so a set that merely came back in a different order does not read
+    as a rotation.
+    """
+    return {
+        (cookie.get("name"), cookie.get("domain"), cookie.get("path"), cookie.get("value"))
+        for cookie in cookies
+    }
+
+
 class ChromiumRenderer:
     """A headless Chromium that renders pages one at a time.
 
@@ -158,6 +233,7 @@ class ChromiumRenderer:
         self,
         *,
         storage_state: Path | None = None,
+        session: SharedSession | None = None,
         viewport: tuple[int, int] = (VIEWPORT_WIDTH, VIEWPORT_HEIGHT),
         timeout_ms: int = PAGE_TIMEOUT_MS,
         settle_ms: int = SETTLE_TIMEOUT_MS,
@@ -174,6 +250,8 @@ class ChromiumRenderer:
         # a nonsense one is worth naming here rather than leaving to Chromium.
         validate_viewport(viewport)
         self._storage_state = Path(storage_state) if storage_state else None
+        self._session = session
+        self._session_version = 0
         self._viewport = viewport
         self._timeout_ms = timeout_ms
         self._settle_ms = settle_ms
@@ -196,6 +274,7 @@ class ChromiumRenderer:
                 ),
             )
             self._context.set_default_timeout(self._timeout_ms)
+            self._adopt_session()
         except BaseException:
             # `__exit__` is not called when `__enter__` raises, so whatever was
             # started above has to be torn down here. Skipping it leaks the
@@ -222,6 +301,24 @@ class ChromiumRenderer:
                     pass
         self._context = self._browser = self._playwright = None
 
+    def _adopt_session(self) -> None:
+        """Take the cookies any other worker has seen since this one looked."""
+        if self._session is None or self._context is None:
+            return
+        cookies, self._session_version = self._session.adopt()
+        if not cookies:
+            # Nothing learned yet. Clearing here would throw away the session
+            # `storage_state` just gave this context, so leave it be.
+            return
+        self._context.clear_cookies()
+        self._context.add_cookies(cookies)
+
+    def _share_session(self) -> None:
+        """Hand this context's cookies back to the pool."""
+        if self._session is None or self._context is None:
+            return
+        self._session.observe(self._context.cookies(), self._session_version)
+
     def visit(self, url: str, screenshot_path: Path) -> PageResult:
         """Load *url* and capture it, converting any browser error into a result.
 
@@ -230,12 +327,22 @@ class ChromiumRenderer:
         a reason to abandon the other 499 pages.
         """
         assert self._context is not None, "visit() used outside the context manager"
+        # Before the request, so it carries whatever token the last worker to
+        # see a rotation came away with.
+        self._adopt_session()
         page = self._context.new_page()
 
         try:
             try:
                 response = page.goto(url, wait_until="load")
                 status = response.status if response is not None else None
+
+                # Shared the moment the response lands, not after the page has
+                # settled. Waiting would put a slow page's token on the bus
+                # behind a fast page's newer one, and the bus keeps whichever
+                # arrived last — so the pool could go *backwards* to a token
+                # that has already been rotated away.
+                self._share_session()
 
                 # A page that keeps polling never reaches "networkidle"; that
                 # is a property of the site, not an error, so the timeout is
@@ -398,23 +505,17 @@ AUTO_WORKERS = 4
 _STOP = object()
 
 
-def worker_count(
-    origin: Origin, requested: int | None = None, *, signed_in: bool = False
-) -> int:
+def worker_count(origin: Origin, requested: int | None = None) -> int:
     """Decide how many render workers to run.
 
     Concurrency is the point on a local app and a liberty anywhere else, so the
     automatic count is generous for loopback and exactly one for the open
     internet: a crawl of someone else's server opens a single connection unless
     the user asks for more.
-
-    A signed-in crawl is one worker whatever the host, because browsers do not
-    share a cookie jar — see `crawl`, which refuses an explicit larger pool
-    rather than quietly ignoring it.
     """
     if requested is not None:
         return max(1, requested)
-    if signed_in or not is_loopback(origin):
+    if not is_loopback(origin):
         return 1
     return min(AUTO_WORKERS, os.cpu_count() or 1)
 
@@ -665,23 +766,12 @@ def crawl(
             "pass renderer_factory to inject a pool"
         )
 
-    # A signed-in crawl defaults to one worker rather than being refused: the
-    # common case is crawling your own app behind a login, and breaking that by
-    # default would be a poor trade for a hazard that only arises from asking
-    # for a pool. Ask for one explicitly and the refusal below is the answer.
-    count = worker_count(
-        origin,
-        1 if renderer is not None else workers,
-        signed_in=storage_state is not None,
-    )
-    if storage_state is not None and count > 1:
-        raise ValueError(
-            "a signed-in crawl cannot use more than one worker: each worker "
-            "gets its own cookie jar, so a session that rotates mid-crawl "
-            "would leave the rest logged out and their pages captured as the "
-            "login page\n"
-            "       crawl signed-out pages concurrently, or drop --workers"
-        )
+    count = worker_count(origin, 1 if renderer is not None else workers)
+
+    # A pool of signed-in workers each gets its own cookie jar, so they share
+    # one through `SharedSession` instead — see its docstring for what that
+    # does and does not cover.
+    session = SharedSession() if storage_state is not None else None
 
     size = validate_viewport(viewport or (VIEWPORT_WIDTH, VIEWPORT_HEIGHT))
 
@@ -690,7 +780,9 @@ def crawl(
             return renderer
         if renderer_factory is not None:
             return renderer_factory()
-        return ChromiumRenderer(storage_state=storage_state, viewport=size)
+        return ChromiumRenderer(
+            storage_state=storage_state, session=session, viewport=size
+        )
 
     store = CrawlStore(output)
     previously = 0
@@ -743,7 +835,8 @@ def crawl(
             f"({_first_line(failure.error)}); continuing with {live}"
         )
     if live > 1:
-        print(f"Rendering {live} pages at a time.")
+        note = ", sharing one session" if session is not None else ""
+        print(f"Rendering {live} pages at a time{note}.")
 
     store.create()
     if not resume:

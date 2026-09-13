@@ -16,10 +16,12 @@ which is how a real app behaves and what `login`/`--storage-state` exist for.
 
 from __future__ import annotations
 
+import itertools
+from collections import deque
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from threading import Thread
+from threading import Lock, Thread
 
 __all__ = ["PAGES", "run_site"]
 
@@ -101,23 +103,65 @@ AUTH_PAGES: dict[str, str] = {
 
 AUTH_COOKIE = "sessionid"
 
+#: A rotating fixture rolls its session over every this many authenticated
+#: requests.
+ROTATION_EVERY = 3
+
+#: How many tokens it still accepts. The window has to exceed the rotations
+#: that can happen while a request is in flight — a real rotating-session
+#: implementation keeps the old key briefly for exactly that reason — but stay
+#: small enough that a browser which never picks up a rotation is eventually
+#: logged out, which is the behaviour these fixtures exist to produce.
+ROTATION_GRACE = 4
+
 
 def _handler(
     pages: dict[str, str],
     cookie: str | None = None,
     protected: frozenset[str] = frozenset(),
+    rotate: bool = False,
 ) -> type[BaseHTTPRequestHandler]:
+    # The tokens still accepted, newest last. Only used in `rotate` mode.
+    #
+    # A grace window rather than "one live token", because that is what real
+    # rotating-session implementations do: they keep the previous key alive
+    # briefly so that a request already in flight is not rejected. Rotating
+    # with no grace would log out anyone with two tabs open, so it is not a
+    # thing an app survives having, and a fixture that modelled it would be
+    # testing a server nobody runs.
+    live: deque[str] = deque(maxlen=ROTATION_GRACE)
+    issued = itertools.count(1)
+    seen = itertools.count(1)
+    lock = Lock()
+
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
-        def _cookies(self) -> dict[str, str]:
+        def _sent_token(self) -> str | None:
             header = self.headers.get("Cookie") or ""
-            return dict(
-                part.strip().split("=", 1) for part in header.split(";") if "=" in part
-            )
+            for part in header.split(";"):
+                name, _, value = part.strip().partition("=")
+                if name == cookie:
+                    return value
+            return None
 
         def _signed_in(self) -> bool:
-            return cookie is not None and cookie in self._cookies()
+            if cookie is None:
+                return False
+            token = self._sent_token()
+            if token is None:
+                return False
+            if not rotate:
+                # The plain fixture only cares that the cookie is there.
+                return True
+            with lock:
+                return token in live
+
+        def _issue(self) -> str:
+            with lock:
+                token = f"t{next(issued)}"
+                live.append(token)
+            return token
 
         def do_GET(self) -> None:  # noqa: N802 - required by BaseHTTPRequestHandler
             if self.path == BROKEN_PATH:
@@ -141,7 +185,17 @@ def _handler(
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(payload)))
             if cookie is not None and self.path == LOGIN_PATH:
-                self.send_header("Set-Cookie", f"{cookie}=signed-in; Path=/")
+                self.send_header(
+                    "Set-Cookie", f"{cookie}={self._issue() if rotate else 'signed-in'}; Path=/"
+                )
+            elif rotate and self._signed_in():
+                # Rolls the session over periodically. The token just used
+                # stays valid until it falls out of the window, so a request
+                # already in flight is not punished for the race.
+                with lock:
+                    due = next(seen) % ROTATION_EVERY == 0
+                if due:
+                    self.send_header("Set-Cookie", f"{cookie}={self._issue()}; Path=/")
             self.end_headers()
             self.wfile.write(payload)
 
@@ -157,20 +211,24 @@ def run_site(
     *,
     cookie: str | None = None,
     protected: Iterable[str] = (),
+    rotate: bool = False,
 ) -> Iterator[str]:
     """Serve *pages* (default `PAGES`) and yield its base URL.
 
     The URL looks like ``http://127.0.0.1:53421``, on an ephemeral port.
 
     Pass *cookie* and *protected* to require a session: those paths redirect to
-    the login page (which sets *cookie*) until the cookie is present.
+    the login page (which sets *cookie*) until the cookie is present. Add
+    *rotate* to make it a site that rolls its session cookie over on every
+    authenticated request and retires the old one — the case where two browsers
+    with separate cookie jars fall out of step.
 
     Bound to 127.0.0.1 rather than localhost on purpose: ``localhost`` can
     resolve to ::1 while the server is listening on IPv4, which would make the
     crawl fail for reasons that have nothing to do with the crawler.
     """
     server = ThreadingHTTPServer(
-        ("127.0.0.1", 0), _handler(pages or PAGES, cookie, frozenset(protected))
+        ("127.0.0.1", 0), _handler(pages or PAGES, cookie, frozenset(protected), rotate)
     )
     thread = Thread(target=server.serve_forever, daemon=True)
     thread.start()
