@@ -18,6 +18,17 @@ DEFAULT_MAX_PAGES = 500
 DEFAULT_SESSION = ".sitegraph/session.json"
 
 
+def _positive(value: str) -> int:
+    """argparse type for a count that has to be at least one."""
+    try:
+        number = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{value!r} is not a number") from None
+    if number < 1:
+        raise argparse.ArgumentTypeError(f"must be at least 1, not {number}")
+    return number
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Return the fully configured argument parser."""
     parser = argparse.ArgumentParser(
@@ -55,6 +66,17 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "continue a crawl in --output that stopped early, instead of "
             "starting over; --max-pages then caps this run rather than the crawl"
+        ),
+    )
+    crawl.add_argument(
+        "--workers",
+        type=_positive,
+        default=None,
+        metavar="N",
+        help=(
+            "pages to render at once; each worker is a browser of its own. "
+            "Defaults to a few for a localhost app and to 1 for anything else, "
+            "so a remote server gets one connection unless asked for more"
         ),
     )
 
@@ -111,6 +133,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 output=Path(args.output),
                 max_pages=args.max_pages,
                 resume=args.resume,
+                workers=args.workers,
                 storage_state=storage_state,
             )
         except ResumeError as exc:
@@ -126,6 +149,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"       expected an absolute http(s) URL, "
                 f'e.g. "http://localhost:3000".'
             ) from None
+        except ValueError as exc:
+            # A combination of flags crawl() will not accept. Checked after
+            # InvalidURL because that is a ValueError too.
+            raise SystemExit(f"error: {exc}") from None
     elif args.command == "login":
         from sitegraph.login import describe, login
         from sitegraph.urls import InvalidURL

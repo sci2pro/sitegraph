@@ -64,6 +64,50 @@ def test_crawl_defaults_to_a_fresh_crawl() -> None:
     assert args.resume is False
 
 
+def test_crawl_lets_the_host_decide_the_worker_count() -> None:
+    """None rather than a number: how many workers is right depends on whether
+    the target is this machine, which the parser cannot know."""
+    args = build_parser().parse_args(["crawl", "http://localhost:3000"])
+
+    assert args.workers is None
+
+
+def test_crawl_accepts_a_worker_count() -> None:
+    args = build_parser().parse_args(["crawl", "http://x/", "--workers", "8"])
+
+    assert args.workers == 8
+
+
+@pytest.mark.parametrize("value", ["0", "-2", "many"])
+def test_crawl_rejects_an_impossible_worker_count(value: str) -> None:
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["crawl", "http://x/", "--workers", value])
+
+
+def test_crawl_refuses_a_pool_for_a_signed_in_crawl(tmp_path: Path) -> None:
+    session = tmp_path / "session.json"
+    session.write_text("{}", encoding="utf-8")
+
+    with pytest.raises(SystemExit) as excinfo:
+        main(
+            [
+                "crawl",
+                "http://localhost:3000",
+                "--output",
+                str(tmp_path / "out"),
+                "--storage-state",
+                str(session),
+                "--workers",
+                "4",
+            ]
+        )
+
+    message = str(excinfo.value)
+    assert "signed-in" in message
+    assert "drop --workers" in message
+    assert not (tmp_path / "out").exists()
+
+
 def test_crawl_accepts_resume() -> None:
     args = build_parser().parse_args(["crawl", "http://localhost:3000", "--resume"])
 

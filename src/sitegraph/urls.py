@@ -25,6 +25,7 @@ the server can depend on it cheaply.
 
 from __future__ import annotations
 
+import ipaddress
 from collections.abc import Iterable
 from dataclasses import dataclass
 from urllib.parse import quote, urljoin, urlsplit
@@ -33,6 +34,7 @@ __all__ = [
     "InvalidURL",
     "Origin",
     "internal_links",
+    "is_loopback",
     "is_internal",
     "normalize_url",
     "origin_of",
@@ -279,6 +281,22 @@ def is_internal(url: str, origin: Origin) -> bool:
         return origin_of(url) == origin
     except InvalidURL:
         return False
+
+
+def is_loopback(origin: Origin) -> bool:
+    """Return whether *origin* is on this machine.
+
+    Used to decide how hard the crawler may lean on a server by default: a
+    localhost app is this tool's stated target, while anything else is someone
+    else's machine and gets one connection unless the user asks for more.
+
+    ``localhost`` is accepted by name as well as by address, since that is how
+    it is usually written and it does not always resolve to a literal.
+    """
+    try:
+        return ipaddress.ip_address(origin.host).is_loopback
+    except ValueError:
+        return origin.host == "localhost"
 
 
 def internal_links(

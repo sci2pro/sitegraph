@@ -17,10 +17,15 @@ Everything is written as it is discovered, so a crawl stopped by Ctrl-C or by
 from __future__ import annotations
 
 import json
+import os
+import signal
+import sys
 import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
+from queue import Empty, Queue
+from threading import Thread
 from typing import Protocol, Self
 from urllib.parse import urlsplit
 
@@ -35,9 +40,17 @@ from sitegraph.store import (
     load_graph,
     page_filename,
 )
-from sitegraph.urls import InvalidURL, internal_links, normalize_url, origin_of
+from sitegraph.urls import (
+    InvalidURL,
+    Origin,
+    internal_links,
+    is_loopback,
+    normalize_url,
+    origin_of,
+)
 
 __all__ = [
+    "AUTO_WORKERS",
     "ChromiumRenderer",
     "PageResult",
     "Renderer",
@@ -45,6 +58,7 @@ __all__ = [
     "ResumeState",
     "crawl",
     "resume_state",
+    "worker_count",
 ]
 
 #: Spec §7: viewport screenshots at 1440x900.
@@ -337,14 +351,250 @@ def _restore_links(graph: Graph, directory: Path) -> None:
         node.links = [link for link in record.get("links") or [] if isinstance(link, str)]
 
 
+#: How long the pool gets to report for duty before the crawl gives up on it.
+STARTUP_TIMEOUT_S = 30.0
+
+#: How long an interrupted crawl waits for workers to come back out of a visit
+#: before abandoning them. A single visit is bounded by the page timeout, so
+#: this only has to cover the tail of one already in flight.
+SHUTDOWN_GRACE_S = 5.0
+
+#: How long the writer waits for a result before checking its workers are still
+#: alive. Not a per-page timeout — pages have their own, in the renderer.
+POLL_SECONDS = 0.25
+
+#: Pool size for a crawl of a machine's own service when no count was asked
+#: for. Enough to cover the waiting without thrashing a laptop.
+AUTO_WORKERS = 4
+
+#: Sent to a worker to tell it to finish.
+_STOP = object()
+
+
+def worker_count(
+    origin: Origin, requested: int | None = None, *, signed_in: bool = False
+) -> int:
+    """Decide how many render workers to run.
+
+    Concurrency is the point on a local app and a liberty anywhere else, so the
+    automatic count is generous for loopback and exactly one for the open
+    internet: a crawl of someone else's server opens a single connection unless
+    the user asks for more.
+
+    A signed-in crawl is one worker whatever the host, because browsers do not
+    share a cookie jar — see `crawl`, which refuses an explicit larger pool
+    rather than quietly ignoring it.
+    """
+    if requested is not None:
+        return max(1, requested)
+    if signed_in or not is_loopback(origin):
+        return 1
+    return min(AUTO_WORKERS, os.cpu_count() or 1)
+
+
+@dataclass(slots=True)
+class _Job:
+    """One page waiting to be rendered, with the scratch path to render it to."""
+
+    seq: int
+    url: str
+    depth: int
+    scratch: Path
+
+
+@dataclass(slots=True)
+class _Ready:
+    index: int
+
+
+@dataclass(slots=True)
+class _Died:
+    """A worker that could not even start, reported for the handshake."""
+
+    index: int
+    error: BaseException
+
+
+@dataclass(slots=True)
+class _Completed:
+    job: _Job
+    result: PageResult
+
+
+@dataclass(slots=True)
+class _Crashed:
+    """A worker whose renderer blew up outside the failures it reports itself."""
+
+    job: _Job
+    error: BaseException
+
+
+class _RenderPool:
+    """A fixed set of threads, each driving its own renderer.
+
+    Workers share nothing: no state, no locks, no counter. Everything a crawl
+    knows lives in the writer thread, which is the only thread that touches the
+    `Graph`, the `CrawlStore`, or the frontier. The two queues carry work out
+    and results back, and both are unbounded — back-pressure is the writer's
+    dispatch window alone, so there is no interleaving in which a worker blocks
+    putting a result and the writer blocks putting work.
+
+    The renderer is built *and* destroyed inside its own thread, because
+    Playwright's sync API binds its driver and event loop to the thread that
+    created them.
+    """
+
+    def __init__(self, factory, count: int) -> None:
+        self._factory = factory
+        self._count = count
+        self._work: Queue = Queue()
+        self._results: Queue = Queue()
+        self._threads: list[Thread] = []
+
+    @property
+    def size(self) -> int:
+        """How many workers were asked for."""
+        return self._count
+
+    def start(self) -> tuple[int, list[_Died]]:
+        """Run every worker's renderer up, and report which ones made it.
+
+        Returns the number that started and the failures, so the caller can
+        decide whether a partial pool is worth continuing with. Waiting for
+        this before anything is written is what keeps "a browser that cannot
+        launch writes nothing" true for the concurrent path too.
+        """
+        for index in range(self._count):
+            thread = Thread(target=self._run, args=(index,), daemon=True)
+            self._threads.append(thread)
+            thread.start()
+
+        live = 0
+        failures: list[_Died] = []
+        deadline = time.monotonic() + STARTUP_TIMEOUT_S
+        for _ in range(self._count):
+            timeout = deadline - time.monotonic()
+            if timeout <= 0:
+                failures.append(_Died(-1, TimeoutError("renderer did not start")))
+                continue
+            message = self._poll(timeout)
+            if isinstance(message, _Ready):
+                live += 1
+            elif isinstance(message, _Died):
+                failures.append(message)
+        return live, failures
+
+    def _run(self, index: int) -> None:
+        """A worker thread: open a renderer, serve jobs, close it again."""
+        try:
+            renderer = self._factory()
+            renderer.__enter__()
+        except BaseException as exc:  # noqa: BLE001 - reported, never swallowed
+            self._results.put(_Died(index, exc))
+            return
+
+        self._results.put(_Ready(index))
+        try:
+            while True:
+                job = self._work.get()
+                if job is _STOP:
+                    break
+                try:
+                    result = renderer.visit(job.url, job.scratch)
+                except BaseException as exc:  # noqa: BLE001
+                    # The loop body must always answer: a worker that dies
+                    # silently would leave the writer waiting on a job that is
+                    # never coming back.
+                    self._results.put(_Crashed(job, exc))
+                    continue
+                self._results.put(_Completed(job, result))
+        finally:
+            # Tears down even on the crash path, and a failure here must not
+            # replace whatever is unwinding.
+            try:
+                renderer.__exit__(None, None, None)
+            except BaseException:  # noqa: BLE001
+                pass
+
+    def submit(self, job: _Job) -> None:
+        self._work.put(job)
+
+    def poll(self, timeout: float):
+        """Return the next message, or ``None`` if none arrives in *time*."""
+        return self._poll(timeout)
+
+    def _poll(self, timeout: float):
+        try:
+            return self._results.get(timeout=timeout)
+        except Empty:
+            return None
+
+    def drain(self) -> list:
+        """Take everything already waiting, without blocking."""
+        messages = []
+        while True:
+            try:
+                messages.append(self._results.get_nowait())
+            except Empty:
+                return messages
+
+    def any_alive(self) -> bool:
+        return any(thread.is_alive() for thread in self._threads)
+
+    def stop_and_join(self, grace: float) -> bool:
+        """Tell every worker to finish; return whether any had to be abandoned.
+
+        A worker blocked on an empty queue wakes on its sentinel at once. One
+        inside a page load finishes that load first, which is why this waits a
+        little rather than stopping dead.
+        """
+        for _ in self._threads:
+            self._work.put(_STOP)
+
+        # `join` per thread rather than a polling loop: a worker sitting on an
+        # empty queue comes back immediately, and a wedged one costs the grace
+        # once, not once each.
+        deadline = time.monotonic() + grace
+        for thread in self._threads:
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        return self.any_alive()
+
+
+def _ignore_further_interrupts() -> None:
+    """Make shutdown interruptible only by killing the process.
+
+    A second Ctrl-C landing halfway through the final writes would leave the
+    crawl without a summary and without its last `graph.json`, which is exactly
+    the state the user is trying to get out of.
+    """
+    try:
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+    except ValueError:  # pragma: no cover - only off the main thread
+        pass
+
+
+def _leave_now(code: int) -> None:
+    """Exit without running interpreter finalisation.
+
+    Only for the case where a worker is still inside Playwright's greenlet
+    machinery: joining it is what we gave up on, and letting CPython finalise
+    around it can abort the process with a code of its own choosing.
+    """
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(code)
+
+
 def crawl(
     url: str,
     output: Path,
     max_pages: int,
     *,
     resume: bool = False,
+    workers: int | None = None,
     storage_state: Path | None = None,
     renderer: Renderer | None = None,
+    renderer_factory=None,
 ) -> None:
     """Crawl *url*, writing graph.json, pages/, and screenshots/ under *output*.
 
@@ -356,12 +606,56 @@ def crawl(
     picks up the pages the last run discovered but never reached, so a site
     larger than the cap can be walked in as many passes as it takes.
 
+    *workers* is how many pages may be rendered at once; ``None`` picks a count
+    from the start URL (see `worker_count`). Rendering is the slow part and it
+    is mostly waiting, so this is where the wall clock goes. Every worker is a
+    thread with its own browser; the crawl's own state never leaves this one,
+    which is why nothing here needs a lock.
+
     *storage_state* is a session saved by `sitegraph login`, used to reach
-    pages that require a sign-in. It is ignored when a *renderer* is supplied —
-    an injected renderer brings its own browser.
+    pages that require a sign-in, and it is why a signed-in crawl is limited to
+    a single worker: separate browsers have separate cookie jars, so a session
+    that rotates mid-crawl would leave all but one of them logged out and their
+    pages captured as the login page under their real URLs.
+
+    *renderer* and *renderer_factory* inject the browser for tests;
+    *renderer* means exactly one worker.
     """
     root_url = normalize_url(url)
     origin = origin_of(root_url)
+
+    if renderer is not None and renderer_factory is not None:
+        raise ValueError("pass either renderer or renderer_factory, not both")
+    if renderer is not None and workers is not None and workers > 1:
+        raise ValueError(
+            "a single renderer cannot serve more than one worker; "
+            "pass renderer_factory to inject a pool"
+        )
+
+    # A signed-in crawl defaults to one worker rather than being refused: the
+    # common case is crawling your own app behind a login, and breaking that by
+    # default would be a poor trade for a hazard that only arises from asking
+    # for a pool. Ask for one explicitly and the refusal below is the answer.
+    count = worker_count(
+        origin,
+        1 if renderer is not None else workers,
+        signed_in=storage_state is not None,
+    )
+    if storage_state is not None and count > 1:
+        raise ValueError(
+            "a signed-in crawl cannot use more than one worker: each worker "
+            "gets its own cookie jar, so a session that rotates mid-crawl "
+            "would leave the rest logged out and their pages captured as the "
+            "login page\n"
+            "       crawl signed-out pages concurrently, or drop --workers"
+        )
+
+    def make_renderer() -> Renderer:
+        if renderer is not None:
+            return renderer
+        if renderer_factory is not None:
+            return renderer_factory()
+        return ChromiumRenderer(storage_state=storage_state)
 
     store = CrawlStore(output)
     previously = 0
@@ -384,7 +678,7 @@ def crawl(
         queue = deque([(root_url, 0)])
 
     queued: set[str] = {url for url, _ in queue} | {node.url for node in graph.nodes}
-    visited = 0
+    committed = 0
 
     if not queue:
         print(
@@ -399,73 +693,199 @@ def crawl(
             f"{len(queue)} discovered but not yet visited."
         )
 
-    # The renderer starts before anything is written: a browser that cannot
-    # launch — or a --storage-state path that does not exist — should fail
-    # without leaving a half-made output directory behind.
-    with (renderer or ChromiumRenderer(storage_state=storage_state)) as browser:
-        store.create()
-        if not resume:
-            # Written before the first page is visited, so an immediate Ctrl-C
-            # still leaves a valid (if empty) dataset rather than no graph.json
-            # at all. It is deliberately empty rather than holding a placeholder
-            # root: every node in graph.json has a page record beside it, at
-            # every moment the file exists.
-            store.write_graph(graph)
+    # The pool starts before anything is written: a browser that cannot launch
+    # — or a --storage-state path that does not exist — should fail without
+    # leaving a half-made output directory behind.
+    pool = _RenderPool(make_renderer, count)
+    live, failures = pool.start()
+    if not live:
+        # Reported unchanged, so a caller sees the FileNotFoundError or
+        # PlaywrightError it would have seen from a single browser.
+        raise failures[0].error
+    for failure in failures:
+        print(
+            f"warning: render worker {failure.index + 1} did not start "
+            f"({_first_line(failure.error)}); continuing with {live}"
+        )
+    if live > 1:
+        print(f"Rendering {live} pages at a time.")
 
-        # A resumed run counts on from where the last one stopped, so the
-        # numbers keep climbing across passes instead of restarting at one.
-        ceiling = previously + max_pages
+    store.create()
+    if not resume:
+        # Written before the first page is visited, so an immediate Ctrl-C
+        # still leaves a valid (if empty) dataset rather than no graph.json at
+        # all. It is deliberately empty rather than holding a placeholder root:
+        # every node in graph.json has a page record beside it, at every moment
+        # the file exists.
+        store.write_graph(graph)
 
-        started = time.monotonic()
-        try:
-            while queue and visited < max_pages:
+    # A resumed run counts on from where the last one stopped, so the numbers
+    # keep climbing across passes instead of restarting at one.
+    ceiling = previously + max_pages
+    started = time.monotonic()
+
+    in_flight: dict[int, _Job] = {}
+    dispatched = 0
+    next_seq = 0
+
+    def absorb(message: object) -> None:
+        """Commit a finished page, if that is what *message* is."""
+        nonlocal committed
+        if not isinstance(message, _Completed):
+            return
+        in_flight.pop(message.job.seq, None)
+        _commit(
+            store,
+            graph,
+            message.job,
+            message.result,
+            origin=origin,
+            root_url=root_url,
+            queued=queued,
+            queue=queue,
+        )
+        committed += 1
+        print(
+            f"[{previously + committed:>4}/{ceiling}] "
+            f"{message.result.status or 'ERR':>4}  "
+            f"{_display(message.job.url)}"
+            + (f"  ({message.result.title})" if message.result.title else "")
+            + (f"  {message.result.error}" if message.result.error else "")
+        )
+
+    def teardown() -> bool:
+        """Stop the workers, closing their browsers; True if one had to be left.
+
+        Whatever the workers completed before the end is real work, and each
+        page published moves the boundary `--resume` will pick up from, so it
+        is all committed rather than dropped.
+        """
+        for message in pool.drain():
+            absorb(message)
+        wedged = pool.stop_and_join(SHUTDOWN_GRACE_S)
+        for message in pool.drain():
+            absorb(message)
+        if not wedged:
+            # Only safe once no worker can still be writing there.
+            store.sweep_incoming()
+        return wedged
+
+    def finish(reason: str, code: int) -> None:
+        _ignore_further_interrupts()
+        wedged = teardown()
+        store.write_graph(graph)
+        print()
+        _report(graph, output, committed, queue, started, len(in_flight))
+        print(reason)
+        if wedged:
+            _leave_now(code)
+        raise SystemExit(code)
+
+    try:
+        while True:
+            # Fill the window. The cap counts dispatches rather than commits,
+            # or the workers would overshoot it by up to a window's worth.
+            while queue and len(in_flight) < live and dispatched < max_pages:
                 page_url, depth = queue.popleft()
-
-                # Registered before the visit so the node has an ID, which is
-                # what names its screenshot. `add_page` is called again below
-                # with what the visit actually found.
-                node = graph.add_page(
-                    page_url, depth=depth, root=page_url == root_url
-                )
-                result = browser.visit(page_url, store.screenshot_path(node.id))
-                visited += 1
-
-                links = internal_links(page_url, result.hrefs, origin)
-
-                graph.add_page(
-                    page_url,
-                    title=result.title,
+                job = _Job(
+                    seq=next_seq,
+                    url=page_url,
                     depth=depth,
-                    status=result.status,
-                    # A failed page has no thumbnail of its own; the UI draws a
-                    # placeholder from `failed` rather than a broken image.
-                    screenshot=None if result.failed else store.screenshot_rel(node.id),
-                    failed=result.failed,
-                    error=result.error,
-                    links=links,
+                    scratch=store.incoming_path(next_seq),
                 )
+                next_seq += 1
+                dispatched += 1
+                # Marked as spoken for here, not when its links are discovered
+                # later: a page still in flight would otherwise be re-dispatched
+                # by whichever page finished first and captured twice.
+                in_flight[job.seq] = job
+                pool.submit(job)
 
-                for target in links:
-                    if target not in queued:
-                        queued.add(target)
-                        queue.append((target, depth + 1))
+            if not in_flight and (not queue or dispatched >= max_pages):
+                break
 
-                print(
-                    f"[{previously + visited:>4}/{ceiling}] "
-                    f"{result.status or 'ERR':>4}  "
-                    f"{_display(page_url)}"
-                    + (f"  ({result.title})" if result.title else "")
-                    + (f"  {result.error}" if result.error else "")
+            message = pool.poll(POLL_SECONDS)
+            if message is None:
+                if not pool.any_alive():
+                    finish(
+                        "The render pool stopped unexpectedly — partial results "
+                        "are still usable.",
+                        1,
+                    )
+                continue
+
+            if isinstance(message, _Crashed):
+                in_flight.pop(message.job.seq, None)
+                if isinstance(message.error, KeyboardInterrupt):
+                    raise KeyboardInterrupt
+                # A renderer that threw outside its own error handling is a
+                # failure like any other: the page is recorded as failed rather
+                # than silently retried or dropped.
+                absorb(
+                    _Completed(
+                        message.job,
+                        PageResult(failed=True, error=_first_line(message.error)),
+                    )
                 )
-                _persist(store, graph, node.id)
-        except KeyboardInterrupt:
-            print()
-            _report(graph, output, visited, queue, started)
-            print("Interrupted — continue with --resume.")
-            raise SystemExit(130) from None
+            elif isinstance(message, _Died):
+                live -= 1
+            else:
+                absorb(message)
+    except KeyboardInterrupt:
+        finish("Interrupted — continue with --resume.", 130)
 
-    _report(graph, output, visited, queue, started)
+    # The workers are idle at this point (nothing is in flight), but they are
+    # still holding browsers open until they are told to stop.
+    teardown()
+    _report(graph, output, committed, queue, started)
     print(f"\nExplore with:  sitegraph serve --dir {output}")
+
+
+def _commit(
+    store: CrawlStore,
+    graph: Graph,
+    job: _Job,
+    result: PageResult,
+    *,
+    origin,
+    root_url: str,
+    queued: set[str],
+    queue: deque[tuple[str, int]],
+) -> None:
+    """Publish one rendered page: screenshot, record, graph, and its new links.
+
+    The node's ID is allocated *here* rather than when the page was dispatched,
+    because IDs are positional and only committed pages may hold one. That is
+    what lets a worker capture a page before its number exists: the picture
+    waits in the scratch directory until this rename gives it a name.
+    """
+    node = graph.add_page(job.url, depth=job.depth, root=job.url == root_url)
+    links = internal_links(job.url, result.hrefs, origin)
+
+    # A failed page has no thumbnail of its own; the UI draws a placeholder
+    # from `failed` rather than a broken image. A page that rendered but whose
+    # capture never landed gets `None` too, which is honest about the same way.
+    screenshot = None
+    if not result.failed and store.adopt_screenshot(job.scratch, node.id):
+        screenshot = store.screenshot_rel(node.id)
+
+    graph.add_page(
+        job.url,
+        title=result.title,
+        depth=job.depth,
+        status=result.status,
+        screenshot=screenshot,
+        failed=result.failed,
+        error=result.error,
+        links=links,
+    )
+
+    for target in links:
+        if target not in queued:
+            queued.add(target)
+            queue.append((target, job.depth + 1))
+
+    _persist(store, graph, node.id)
 
 
 def _persist(store: CrawlStore, graph: Graph, node_id: str) -> None:
@@ -487,13 +907,18 @@ def _report(
     visited: int,
     queue: deque[tuple[str, int]],
     started: float,
+    abandoned: int = 0,
 ) -> None:
     """Print the end-of-crawl summary.
 
-    *queue* is what is left over, which is not the same as "pages nobody has
-    looked at": a page that failed to render is put back in the queue, so the
-    count can hold steady across resumes. Saying so beats letting a user watch
-    a number refuse to fall and wonder what is wrong.
+    The pages still to capture are the queue *plus* anything abandoned in
+    flight when the run ended: an interrupted page was never published, so
+    `--resume` will find it again from the record of whatever linked to it, and
+    the number here has to match what the next run will actually do.
+
+    *queue* also holds pages that failed to render, which is why the count can
+    hold steady across resumes. Saying so beats letting a user watch a number
+    refuse to fall and wonder what is wrong.
     """
     elapsed = time.monotonic() - started
     print(
@@ -505,10 +930,11 @@ def _report(
     if failed:
         print(f"{len(failed)} page(s) failed to render (kept in the graph).")
 
-    if queue:
+    remaining = len(queue) + abandoned
+    if remaining:
         retrying = sum(1 for url, _ in queue if url in failed)
         print(
-            f"{len(queue)} page(s) still to capture — run the same command "
+            f"{remaining} page(s) still to capture — run the same command "
             f"with --resume to continue."
         )
         if retrying:

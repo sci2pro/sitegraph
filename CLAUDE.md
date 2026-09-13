@@ -31,10 +31,73 @@ The `sitegraph` entry point is wired through `[project.scripts]`; `uv run python
 
 ```bash
 uv run sitegraph crawl http://localhost:3000
+uv run sitegraph crawl http://localhost:3000 --workers 8   # render more at once
 uv run sitegraph crawl http://localhost:3000 --resume    # carry on a capped crawl
 uv run sitegraph login http://localhost:3000/login       # only for signed-in crawls
 uv run sitegraph serve
 ```
+
+## Concurrency
+
+Rendering a page is mostly waiting — for navigation, and for the network-idle
+settle — so the crawler renders several at once. Measured on a 25-page local
+site: 15.8 s at one worker, 4.7 s at four, 3.2 s at eight.
+
+```bash
+uv run sitegraph crawl http://localhost:3000              # a few workers: it is this machine
+uv run sitegraph crawl https://staging.example.com        # one: it is someone else's
+uv run sitegraph crawl https://staging.example.com --workers 4   # your call
+```
+
+The automatic count is `min(4, cores)` for a loopback host and **1 for
+anything else**, so a real server gets a single connection unless you ask for
+more. `--workers N` overrides it either way. `urls.py::is_loopback` decides;
+`crawl.py::worker_count` applies it.
+
+**One writer, N render workers.** The writer is the thread that calls `crawl`,
+and it owns everything — the frontier, the `queued` set, the `Graph`, the
+counters, and every write to disk. Workers own nothing shared: each builds its
+own renderer (Playwright's sync API binds its driver to the thread that made
+it), serves jobs from a queue, and closes it on the way out. That is why none
+of this needs a lock, and why `graph.json` cannot be written from two places.
+
+**IDs are allocated when a page is committed, not when it is dispatched.** A
+worker needs a filename before its node has a number, so it captures to
+`screenshots/.incoming/<seq>.webp` and the writer renames it into place at
+commit. Registering the node early instead would put not-yet-captured pages
+into `graph.json` — which is rewritten on every commit — so the file would
+briefly reference page records that do not exist, and `serve` would 404 them.
+The consequences of commit-time allocation are worth knowing:
+
+- **In-flight pages are invisible on disk**, so an interrupted visit simply
+  vanishes: nothing was published, and `--resume` finds the URL again in the
+  record of whatever page linked to it.
+- **IDs stay dense and commit-ordered**, so `resume_state`'s density check
+  keeps working and an interrupted run never leaves gaps.
+- **With one worker nothing changes at all** — job FIFO reproduces BFS order,
+  so IDs, depths and the incremental-publish sequence are exactly what they
+  were before concurrency existed. All the crawl tests that assert ordering run
+  at `workers=1` for that reason, including the e2e fixture.
+- **With more than one worker, IDs follow completion order** and are not
+  reproducible between runs — as are the progress lines, and the depth of a
+  page reachable by two paths. The *content* is identical: same URL set, same
+  edges, same root. `tests/test_e2e.py` asserts both halves of that.
+
+**A signed-in crawl is one worker, always.** Browsers do not share a cookie
+jar, so a session that rotates mid-crawl would leave every other worker logged
+out and their pages recorded as the login page under their real URLs. Passing
+`--workers > 1` with `--storage-state` is refused rather than warned about; the
+automatic count comes out at 1 so the common case — crawling your own app
+behind a login — just works.
+
+Shutdown is `_RenderPool.stop_and_join`: sentinels stop the workers, a short
+grace lets any visit already in flight finish, and a worker still wedged after
+that is abandoned rather than waited for (`os._exit`, because joining a thread
+inside Playwright's greenlet machinery can abort with a code of its own).
+Everything already completed is committed first, so Ctrl-C costs at most the
+pages in flight. `tests/test_crawl_workers.py` covers the hazards concurrency
+introduces, forcing the interleavings with barriers and events rather than
+hoping to hit them.
 
 ## Stopping early, and carrying on
 

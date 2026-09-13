@@ -6,7 +6,9 @@ browser UI read it, and a user may reasonably look at it by hand::
     .sitegraph/
     ├── graph.json          # whole graph; independent of the per-page files
     ├── pages/000001.json   # one record per page
-    └── screenshots/000001.webp
+    └── screenshots/
+        ├── 000001.webp
+        └── .incoming/      # transient; see INCOMING_DIR below
 
 The filenames live here so that the writer (`crawl`) and the readers (`serve`,
 the UI) cannot drift apart. Paths stored *inside* the data — a node's
@@ -18,6 +20,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +28,7 @@ from sitegraph.graph import Graph
 
 __all__ = [
     "GRAPH_FILE",
+    "INCOMING_DIR",
     "PAGES_DIR",
     "SCREENSHOTS_DIR",
     "SCREENSHOT_EXT",
@@ -39,6 +43,14 @@ GRAPH_FILE = "graph.json"
 PAGES_DIR = "pages"
 SCREENSHOTS_DIR = "screenshots"
 SCREENSHOT_EXT = "webp"
+
+#: Where workers drop a capture before its node exists. A concurrent crawl has
+#: to render a page before it can know the page's ID, and the ID is positional,
+#: so the picture waits here until the writer commits it under its real name.
+#: The directory is transient: it is emptied on every `create()` and nothing
+#: outside `crawl` ever reads it. `serve` cannot reach it either — its route
+#: matches a single path segment with no separator in it.
+INCOMING_DIR = ".incoming"
 
 
 class CrawlNotFound(Exception):
@@ -109,6 +121,46 @@ class CrawlStore:
         """Create the output tree. Safe to call on an existing directory."""
         (self.directory / PAGES_DIR).mkdir(parents=True, exist_ok=True)
         (self.directory / SCREENSHOTS_DIR).mkdir(parents=True, exist_ok=True)
+        self.sweep_incoming()
+
+    def incoming_path(self, token: int) -> Path:
+        """Scratch path for a capture whose node does not exist yet.
+
+        *token* need only be unique within a run; the file is renamed into
+        ``screenshots/`` the moment its node is committed.
+        """
+        return (
+            self.directory
+            / SCREENSHOTS_DIR
+            / INCOMING_DIR
+            / f"{token}.{SCREENSHOT_EXT}"
+        )
+
+    def sweep_incoming(self) -> None:
+        """Empty the scratch directory, recreating it.
+
+        Anything in there belongs to a run that ended without committing —
+        either it was interrupted or it died — so it is not referenced by
+        ``graph.json`` and keeping it would only accumulate orphans.
+        """
+        incoming = self.directory / SCREENSHOTS_DIR / INCOMING_DIR
+        if incoming.is_dir():
+            shutil.rmtree(incoming, ignore_errors=True)
+        incoming.mkdir(parents=True, exist_ok=True)
+
+    def adopt_screenshot(self, scratch: Path, node_id: str) -> bool:
+        """Move a worker's capture into ``screenshots/`` under *node_id*.
+
+        Returns whether there was anything to move: a page can render fine and
+        still have no picture, and reporting that honestly is better than
+        writing a ``screenshot`` path that points at nothing.
+        """
+        if not scratch.is_file():
+            return False
+        # `os.replace` is atomic, so a screenshot is never half-published any
+        # more than a JSON file is.
+        os.replace(scratch, self.screenshot_path(node_id))
+        return True
 
     def screenshot_path(self, node_id: str) -> Path:
         """Absolute path to write *node_id*'s screenshot to."""

@@ -62,6 +62,40 @@ def test_screenshot_paths_are_relative_to_the_output_directory() -> None:
     )
 
 
+def test_the_scratch_directory_is_swept_on_create(tmp_path: Path) -> None:
+    """Anything left there belongs to a run that never committed it."""
+    store = CrawlStore(tmp_path / "out")
+    store.create()
+    orphan = store.incoming_path(1)
+    orphan.write_bytes(b"left over from a run that died")
+
+    store.create()
+
+    assert not orphan.exists()
+    assert orphan.parent.is_dir(), "the directory itself is recreated"
+
+
+def test_a_capture_is_moved_into_place_under_the_node_id(tmp_path: Path) -> None:
+    store = CrawlStore(tmp_path / "out")
+    store.create()
+    scratch = store.incoming_path(7)
+    scratch.write_bytes(b"a picture")
+
+    assert store.adopt_screenshot(scratch, "000012") is True
+    assert not scratch.exists()
+    assert store.screenshot_path("000012").read_bytes() == b"a picture"
+    assert store.screenshot_rel("000012") == "screenshots/000012.webp"
+
+
+def test_a_capture_that_never_landed_is_reported(tmp_path: Path) -> None:
+    """A page can render and still have no picture; saying so beats writing a
+    `screenshot` path that points at nothing."""
+    store = CrawlStore(tmp_path / "out")
+    store.create()
+
+    assert store.adopt_screenshot(store.incoming_path(1), "000012") is False
+
+
 def test_json_is_written_atomically(tmp_path: Path) -> None:
     """A killed crawl must never leave a half-written graph.json behind, so the
     write lands through a temporary file that is renamed into place."""

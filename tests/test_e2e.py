@@ -54,9 +54,15 @@ def site():
 
 @pytest.fixture(scope="module")
 def crawled(site: str, tmp_path_factory: pytest.TempPathFactory) -> Path:
-    """A real crawl of *site*, written to a temporary directory."""
+    """A real crawl of *site*, written to a temporary directory.
+
+    One worker, deliberately. Queue order decides ID order, and ID order is
+    only defined at width one — a pool assigns IDs in completion order, which
+    is exactly the thing these tests must not depend on. Concurrency has its
+    own test below, asserting the properties that do not care about order.
+    """
     output = tmp_path_factory.mktemp("crawl") / ".sitegraph"
-    crawl(site, output, 100)
+    crawl(site, output, 100, workers=1)
     return output
 
 
@@ -72,6 +78,24 @@ def by_path(graph: dict) -> dict[str, dict]:
         parts = urlsplit(node["url"])
         keyed[parts.path + (f"?{parts.query}" if parts.query else "")] = node
     return keyed
+
+
+def url_set(graph: dict) -> list[str]:
+    return sorted(node["url"] for node in graph["nodes"])
+
+
+def url_edges(graph: dict) -> list[tuple[str, str]]:
+    """Edges as URL pairs, so they can be compared across two crawls whose IDs
+    were handed out in different orders."""
+    by_id = {node["id"]: node["url"] for node in graph["nodes"]}
+    return sorted({(by_id[edge["source"]], by_id[edge["target"]]) for edge in graph["edges"]})
+
+
+def root_url(graph: dict) -> str | None:
+    for node in graph["nodes"]:
+        if node["id"] == graph["root"]:
+            return node["url"]
+    return None
 
 
 # --- what got crawled ---------------------------------------------------
@@ -501,13 +525,12 @@ def test_resuming_a_capped_crawl_finishes_it(
             break
 
     finished = json.loads((output / GRAPH_FILE).read_text())
-    assert [node["url"] for node in finished["nodes"]] == [
-        node["url"] for node in graph["nodes"]
-    ]
-    assert [node["id"] for node in finished["nodes"]] == [
-        node["id"] for node in graph["nodes"]
-    ]
-    assert finished["edges"] == graph["edges"]
+    # Compared as URLs rather than IDs: a resumed run picks up with a pool, so
+    # its IDs follow completion order, but what the crawl *found* must be
+    # identical to a crawl that ran to the end in one go.
+    assert url_set(finished) == url_set(graph)
+    assert url_edges(finished) == url_edges(graph)
+    assert root_url(finished) == root_url(graph)
 
 
 def test_resume_does_not_recapture_screenshots(site: str, tmp_path: Path) -> None:
@@ -529,6 +552,30 @@ def test_resume_does_not_recapture_screenshots(site: str, tmp_path: Path) -> Non
     for name in kept:
         assert after[name] == stamps[name], f"{name} was captured twice"
     assert len(after) > len(kept), "the second run captured new pages"
+
+
+def test_a_concurrent_crawl_finds_the_same_site(
+    site: str, tmp_path: Path, graph: dict
+) -> None:
+    """The point of the pool is that it is faster, not that it is different:
+    the same site, crawled four pages at a time, must produce the same graph
+    apart from the order the nodes were numbered in."""
+    output = tmp_path / "concurrent"
+    crawl(site, output, 100, workers=4)
+    concurrent = json.loads((output / GRAPH_FILE).read_text())
+
+    assert url_set(concurrent) == url_set(graph)
+    assert url_edges(concurrent) == url_edges(graph)
+    assert root_url(concurrent) == root_url(graph)
+    assert len(concurrent["nodes"]) == len(graph["nodes"])
+
+    for node in concurrent["nodes"]:
+        if node["failed"]:
+            assert node["screenshot"] is None
+            continue
+        assert node["screenshot"] == f"screenshots/{node['id']}.webp"
+        assert (output / node["screenshot"]).is_file()
+    assert not list((output / SCREENSHOTS_DIR / ".incoming").glob("*"))
 
 
 def test_cli_resume_round_trip(tmp_path: Path, site: str) -> None:

@@ -15,6 +15,7 @@ from sitegraph.urls import (
     Origin,
     internal_links,
     is_internal,
+    is_loopback,
     normalize_url,
     origin_of,
     resolve_href,
@@ -265,6 +266,33 @@ def test_origin_str() -> None:
 )
 def test_is_internal(url: str, internal: bool) -> None:
     assert is_internal(url, origin_of("http://example.com/")) is internal
+
+
+# --- loopback ---------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("url", "local"),
+    [
+        ("http://localhost:3000/", True),
+        ("http://LOCALHOST/", True),  # host case folds before this is asked
+        ("http://127.0.0.1/", True),
+        ("http://127.0.0.1:8080/", True),
+        # 127.0.0.0/8 is loopback, not just the one address
+        ("http://127.9.9.9/", True),
+        ("http://[::1]:3000/", True),
+        # a dev server on the LAN is still someone else's machine
+        ("http://192.168.1.5:3000/", False),
+        ("http://10.0.0.4/", False),
+        ("http://0.0.0.0:3000/", False),  # a wildcard bind, not an address
+        ("https://example.com/", False),
+        # "localhost" has to match as a name, not as a prefix or a suffix
+        ("http://localhost.example.com/", False),
+        ("http://notlocalhost/", False),
+    ],
+)
+def test_is_loopback(url: str, local: bool) -> None:
+    assert is_loopback(origin_of(url)) is local
 
 
 # --- internal_links ---------------------------------------------------------

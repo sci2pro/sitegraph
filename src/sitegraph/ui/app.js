@@ -484,6 +484,21 @@ function renderSheet() {
 
 /* ------------------------------------------------------- pan / zoom / fit */
 
+/** Capture the pointer, tolerating one that is already gone.
+ *
+ * `setPointerCapture` throws if the pointer is no longer active — a pointer
+ * released between the event and this call, or a synthetic event. Letting that
+ * escape would abandon the drag halfway through setting it up and surface as
+ * an uncaught error, for a gesture the user can simply start again.
+ */
+function capturePointer(element, pointerId) {
+  try {
+    element.setPointerCapture(pointerId);
+  } catch {
+    /* the drag still works; it just is not tracked outside the element */
+  }
+}
+
 function applyTransform() {
   const { x, y, k } = state.transform;
   $("world").style.transform = `translate(${x}px, ${y}px) scale(${k})`;
@@ -809,7 +824,7 @@ function wireEvents() {
     if (event.target.closest(".node")) return;
     if (event.target.closest(".hud")) return;
     stage.classList.add("panning");
-    stage.setPointerCapture(event.pointerId);
+    capturePointer(stage, event.pointerId);
     const start = {
       x: event.clientX,
       y: event.clientY,
@@ -851,7 +866,7 @@ function wireEvents() {
     if (!point) return;
     const start = { x: event.clientX, y: event.clientY, px: point.x, py: point.y };
     let moved = false;
-    card.setPointerCapture(event.pointerId);
+    capturePointer(card, event.pointerId);
 
     const move = (moveEvent) => {
       const k = state.transform.k;
