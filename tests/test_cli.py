@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from sitegraph.cli import build_parser, main
+from sitegraph.cli import DEFAULT_VIEWPORT, build_parser, main
 from sitegraph.store import GRAPH_FILE
 
 
@@ -62,6 +62,48 @@ def test_crawl_defaults_to_a_fresh_crawl() -> None:
     args = build_parser().parse_args(["crawl", "http://localhost:3000"])
 
     assert args.resume is False
+
+
+def test_the_documented_default_viewport_matches_the_crawler() -> None:
+    """The help text spells the default out so `--help` need not import
+    Playwright; this is what stops the spelling drifting from the code."""
+    from sitegraph.crawl import VIEWPORT_HEIGHT, VIEWPORT_WIDTH
+
+    assert DEFAULT_VIEWPORT == f"{VIEWPORT_WIDTH}x{VIEWPORT_HEIGHT}"
+
+
+def test_crawl_defaults_to_the_documented_viewport() -> None:
+    args = build_parser().parse_args(["crawl", "http://localhost:3000"])
+
+    assert args.viewport is None, "None means 'whatever the crawler defaults to'"
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [("1920x1080", (1920, 1080)), ("390X844", (390, 844)), ("800x600", (800, 600))],
+)
+def test_crawl_accepts_a_viewport(value: str, expected: tuple[int, int]) -> None:
+    args = build_parser().parse_args(["crawl", "http://x/", "--viewport", value])
+
+    assert args.viewport == expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "1920",  # one number is not a size
+        "1920x",  # and neither is half of one
+        "abc",
+        "1920x1080x2",
+        "-100x100",
+        "0x100",  # nothing to render into
+        "100x0",
+        "99999x100",  # a typo rather than a screen
+    ],
+)
+def test_crawl_rejects_an_impossible_viewport(value: str) -> None:
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["crawl", "http://x/", "--viewport", value])
 
 
 def test_crawl_lets_the_host_decide_the_worker_count() -> None:

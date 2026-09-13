@@ -29,6 +29,28 @@ def _positive(value: str) -> int:
     return number
 
 
+#: Spelled out rather than read from `crawl.VIEWPORT_*`, because importing
+#: that module imports Playwright — which the lazy imports above exist to keep
+#: out of `--help` and shell completion. `test_cli.py` fails if they drift.
+DEFAULT_VIEWPORT = "1440x900"
+
+
+def _viewport(value: str) -> tuple[int, int]:
+    """argparse type for a ``WxH`` capture size."""
+    from sitegraph.crawl import validate_viewport
+
+    parts = value.lower().split("x")
+    if len(parts) != 2 or not all(part.strip().isdigit() for part in parts):
+        raise argparse.ArgumentTypeError(
+            f"expected a size like 1440x900, not {value!r}"
+        )
+    width, height = (int(part) for part in parts)
+    try:
+        return validate_viewport((width, height))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Return the fully configured argument parser."""
     parser = argparse.ArgumentParser(
@@ -66,6 +88,17 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "continue a crawl in --output that stopped early, instead of "
             "starting over; --max-pages then caps this run rather than the crawl"
+        ),
+    )
+    crawl.add_argument(
+        "--viewport",
+        type=_viewport,
+        default=None,
+        metavar="WxH",
+        help=(
+            "size to render pages at, which is also the size of every "
+            f"screenshot (default: {DEFAULT_VIEWPORT}). A narrow one gets the "
+            "responsive layout, so this changes what the pages look like"
         ),
     )
     crawl.add_argument(
@@ -130,6 +163,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         try:
             crawl(
                 url=args.url,
+                viewport=args.viewport,
                 output=Path(args.output),
                 max_pages=args.max_pages,
                 resume=args.resume,

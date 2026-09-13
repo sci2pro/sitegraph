@@ -214,19 +214,18 @@ def test_every_rendered_page_has_a_screenshot(graph: dict, crawled: Path) -> Non
         assert data[:4] == b"RIFF" and data[8:12] == b"WEBP"
 
 
-def test_screenshots_are_rendered_pages_at_the_documented_viewport(
-    graph: dict, crawled: Path
-) -> None:
-    """The bytes must be a picture of the page, at 1440x900 — not a blank frame."""
-    root = graph["nodes"][0]
-    shot = (crawled / root["screenshot"]).resolve()
+def measure(shot: Path) -> dict:
+    """Open a screenshot in a browser and report what it actually is.
 
+    Decoding in the browser rather than parsing the container by hand: WebP
+    has several chunk layouts, and this is the same reader the UI uses.
+    """
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch()
         page = browser.new_page()
         try:
-            page.goto(shot.as_uri())
-            measured = page.evaluate("""() => {
+            page.goto(shot.resolve().as_uri())
+            return page.evaluate("""() => {
               const img = document.querySelector('img');
               const canvas = document.createElement('canvas');
               canvas.width = img.naturalWidth;
@@ -238,11 +237,21 @@ def test_screenshots_are_rendered_pages_at_the_documented_viewport(
               for (let i = 0; i < data.length; i += 4) {
                 if (data[i] < 200 || data[i+1] < 200 || data[i+2] < 200) ink++;
               }
+              const corner = ctx.getImageData(4, 4, 1, 1).data;
               return {width: img.naturalWidth, height: img.naturalHeight,
-                      ink, total: canvas.width * canvas.height};
+                      ink, total: canvas.width * canvas.height,
+                      corner: [corner[0], corner[1], corner[2]]};
             }""")
         finally:
             browser.close()
+
+
+def test_screenshots_are_rendered_pages_at_the_documented_viewport(
+    graph: dict, crawled: Path
+) -> None:
+    """The bytes must be a picture of the page, at 1440x900 — not a blank frame."""
+    root = graph["nodes"][0]
+    measured = measure(crawled / root["screenshot"])
 
     assert measured["width"] == VIEWPORT_WIDTH
     assert measured["height"] == VIEWPORT_HEIGHT
@@ -256,6 +265,50 @@ def test_screenshot_count_matches_rendered_pages(graph: dict, crawled: Path) -> 
     files = sorted((crawled / SCREENSHOTS_DIR).glob("*.webp"))
 
     assert len(files) == len(rendered)
+
+
+def test_a_custom_viewport_resizes_every_screenshot(site: str, tmp_path: Path) -> None:
+    """The whole chain: `--viewport` reaches the browser, and every picture
+    comes out that size rather than the hardcoded one."""
+    from sitegraph.cli import main
+
+    output = tmp_path / "narrow"
+    assert main(["crawl", site, "--output", str(output), "--max-pages", "3",
+                 "--viewport", "800x600"]) == 0
+
+    graph = json.loads((output / GRAPH_FILE).read_text())
+    assert len(graph["nodes"]) == 3
+    for node in graph["nodes"]:
+        measured = measure(output / node["screenshot"])
+        assert (measured["width"], measured["height"]) == (800, 600)
+
+
+def test_a_narrow_viewport_is_a_different_rendering_not_a_smaller_picture(
+    tmp_path: Path,
+) -> None:
+    """The reason to allow a viewport at all: a narrow one gets the site's
+    responsive layout, so the screenshots show what a phone would see. The page
+    below paints a black square only when the media query matches, which makes
+    that visible as a single pixel rather than as a guess about file size."""
+    page = """<!doctype html><html><head><meta charset='utf-8'>
+      <title>Responsive</title><style>
+        body { margin: 0; background: #fff }
+        #phone { display: none; width: 200px; height: 200px; background: #000 }
+        @media (max-width: 600px) { #phone { display: block } }
+      </style></head><body><div id="phone"></div></body></html>"""
+
+    with run_site({"/": page}) as local:
+        wide_dir = tmp_path / "wide"
+        narrow_dir = tmp_path / "narrow"
+        crawl(local, wide_dir, 1, viewport=(1440, 900), workers=1)
+        crawl(local, narrow_dir, 1, viewport=(390, 844), workers=1)
+
+    def corner_of(directory: Path) -> list[int]:
+        node = json.loads((directory / GRAPH_FILE).read_text())["nodes"][0]
+        return measure(directory / node["screenshot"])["corner"]
+
+    assert corner_of(wide_dir) == [255, 255, 255], "the media query should not match"
+    assert corner_of(narrow_dir) == [0, 0, 0], "390px wide should match it"
 
 
 # --- the browser UI -----------------------------------------------------

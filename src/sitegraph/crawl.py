@@ -61,9 +61,15 @@ __all__ = [
     "worker_count",
 ]
 
-#: Spec §7: viewport screenshots at 1440x900.
+#: Spec §7: viewport screenshots at 1440x900. This is what a crawl uses unless
+#: `--viewport` says otherwise, and it is the size the UI's node cards are
+#: proportioned for.
 VIEWPORT_WIDTH = 1440
 VIEWPORT_HEIGHT = 900
+
+#: A viewport wider or taller than this is a typo, not a screen. Bounded here
+#: so a bad number is a sentence rather than a browser that hangs.
+MAX_VIEWPORT = 10_000
 
 #: WebP at q80 — a page at this size lands around 60-100 KB, roughly a quarter
 #: of the PNG equivalent. Spec §7 prefers WebP to keep the dataset small.
@@ -117,6 +123,24 @@ class Renderer(Protocol):
     def __exit__(self, *exc_info: object) -> None: ...
 
 
+def validate_viewport(viewport: tuple[int, int]) -> tuple[int, int]:
+    """Check a ``(width, height)`` capture size, and return it.
+
+    Raising `ValueError` here keeps the failure in the caller's vocabulary:
+    Chromium's own complaint about an impossible viewport is a protocol error
+    from three layers down, several seconds after the browser started.
+    """
+    width, height = viewport
+    if width < 1 or height < 1:
+        raise ValueError(f"a viewport must be positive, not {width}x{height}")
+    if width > MAX_VIEWPORT or height > MAX_VIEWPORT:
+        raise ValueError(
+            f"a viewport of {width}x{height} is larger than {MAX_VIEWPORT} in a "
+            f"direction; that is a typo rather than a screen"
+        )
+    return viewport
+
+
 def _first_line(exc: Exception) -> str:
     """Playwright errors are a message plus a multi-line call log; keep the message."""
     text = str(exc).strip()
@@ -146,6 +170,9 @@ class ChromiumRenderer:
                 f"no session file at {storage_state} "
                 f"(create one with `sitegraph login`)"
             )
+        # The viewport decides both the layout and the size of the picture, so
+        # a nonsense one is worth naming here rather than leaving to Chromium.
+        validate_viewport(viewport)
         self._storage_state = Path(storage_state) if storage_state else None
         self._viewport = viewport
         self._timeout_ms = timeout_ms
@@ -592,6 +619,7 @@ def crawl(
     *,
     resume: bool = False,
     workers: int | None = None,
+    viewport: tuple[int, int] | None = None,
     storage_state: Path | None = None,
     renderer: Renderer | None = None,
     renderer_factory=None,
@@ -611,6 +639,11 @@ def crawl(
     is mostly waiting, so this is where the wall clock goes. Every worker is a
     thread with its own browser; the crawl's own state never leaves this one,
     which is why nothing here needs a lock.
+
+    *viewport* is the ``(width, height)`` the pages are rendered at, which is
+    also the size of every screenshot. Smaller is not a smaller picture of the
+    same page — a narrow viewport gets the responsive layout, which is the
+    point of asking for one. Defaults to spec §7's 1440x900.
 
     *storage_state* is a session saved by `sitegraph login`, used to reach
     pages that require a sign-in, and it is why a signed-in crawl is limited to
@@ -650,12 +683,14 @@ def crawl(
             "       crawl signed-out pages concurrently, or drop --workers"
         )
 
+    size = validate_viewport(viewport or (VIEWPORT_WIDTH, VIEWPORT_HEIGHT))
+
     def make_renderer() -> Renderer:
         if renderer is not None:
             return renderer
         if renderer_factory is not None:
             return renderer_factory()
-        return ChromiumRenderer(storage_state=storage_state)
+        return ChromiumRenderer(storage_state=storage_state, viewport=size)
 
     store = CrawlStore(output)
     previously = 0

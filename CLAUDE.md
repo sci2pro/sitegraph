@@ -31,11 +31,32 @@ The `sitegraph` entry point is wired through `[project.scripts]`; `uv run python
 
 ```bash
 uv run sitegraph crawl http://localhost:3000
-uv run sitegraph crawl http://localhost:3000 --workers 8   # render more at once
-uv run sitegraph crawl http://localhost:3000 --resume    # carry on a capped crawl
-uv run sitegraph login http://localhost:3000/login       # only for signed-in crawls
+uv run sitegraph crawl http://localhost:3000 --workers 8     # render more at once
+uv run sitegraph crawl http://localhost:3000 --viewport 390x844   # capture a phone layout
+uv run sitegraph crawl http://localhost:3000 --resume        # carry on a capped crawl
+uv run sitegraph login http://localhost:3000/login           # only for signed-in crawls
 uv run sitegraph serve
 ```
+
+## Capture size
+
+`--viewport WxH` sets both the size pages are rendered at and the size of every
+screenshot; 1440x900 (spec §7) unless given. It is a *viewport*, not a resize:
+a narrow one gets the site's responsive layout, so the screenshots show what
+that device would see. That distinction is the whole point — `--viewport
+390x844` on a site with a mobile breakpoint captures the mobile page, whereas
+resizing the image afterwards would just give a smaller desktop page.
+
+The flag reaches the browser through `crawl(viewport=...)` →
+`ChromiumRenderer`. `cli.DEFAULT_VIEWPORT` spells the default out rather than
+importing it, so that `--help` and shell completion do not pay for the
+Playwright import that the lazy command imports exist to avoid; a test fails if
+it drifts from `crawl.VIEWPORT_*`.
+
+The UI needs no special handling for a non-default viewport. Node cards use
+`object-fit: cover` with `object-position: top left`, so a portrait capture is
+cropped to the top of the page — a header-shaped thumbnail — rather than
+squashed. Verified by crawling the fixture at 390x844 and 1920x1080.
 
 ## Concurrency
 
@@ -82,6 +103,13 @@ The consequences of commit-time allocation are worth knowing:
   reproducible between runs — as are the progress lines, and the depth of a
   page reachable by two paths. The *content* is identical: same URL set, same
   edges, same root. `tests/test_e2e.py` asserts both halves of that.
+- **A capped crawl is the exception to that.** A page's links join the frontier
+  when the page finishes, so with `--max-pages` and a pool, *which* pages make
+  the last few slots is a race: a crawl of the fixture that stopped at eight
+  took `/missing` in one run and `/courses/new` in another, both depth two.
+  Pages are dispatched in frontier order and the cap counts dispatches, so
+  nothing is overshot — but the cut line moves. Use `--workers 1` when a capped
+  crawl needs to be reproducible.
 
 **A signed-in crawl is one worker, always.** Browsers do not share a cookie
 jar, so a session that rotates mid-crawl would leave every other worker logged
