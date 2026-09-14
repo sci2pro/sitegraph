@@ -35,11 +35,59 @@ uv run sitegraph crawl http://localhost:3000 --workers 8     # render more at on
 uv run sitegraph crawl http://localhost:3000 --viewport 390x844   # capture a phone layout
 uv run sitegraph crawl http://localhost:3000 --per-pattern 1   # one page per route
 uv run sitegraph crawl http://localhost:3000 --skip /admin    # leave a path alone
+uv run sitegraph crawl http://localhost:3000 --full-page     # the whole page, not the fold
 uv run sitegraph crawl http://localhost:3000 --dry-run       # look before writing
 uv run sitegraph crawl http://localhost:3000 --resume        # carry on a capped crawl
 uv run sitegraph login http://localhost:3000/login           # only for signed-in crawls
 uv run sitegraph serve
 ```
+
+## Whole-page captures
+
+```bash
+uv run sitegraph crawl localhost:3000 --full-page
+```
+
+Spec §7 captures the *viewport* and calls full-page captures unnecessary for
+the first version. `--full-page` is that, opt-in: a long page arrives as one
+tall image rather than its first 900 pixels.
+
+```
+/                     1440x900      1440x900
+/long                 1440x900      1440x5120     <- six screens
+/short                1440x900      1440x900      <- nothing to scroll
+```
+
+`--viewport` still decides the width the page is laid out at; only the height
+of the picture changes, and a page shorter than the viewport is unchanged
+(Chromium will not return a picture smaller than the window it rendered in).
+It is not free: the same three-page crawl went from 92 KB to 352 KB of WebP,
+because a tall page is many times the pixels.
+
+**The viewer had to learn about it, and that was not optional.** A capture
+taller than it is wide is cropped to its top sliver by `object-fit: cover` in
+a box shaped like a screen — so `--full-page` would have produced data the
+inspector could not show, which is precisely what the flag was asked for. The
+inspector's shot is now allowed its own height and the panel scrolls to it,
+decided by asking the *image* rather than the graph (`thumb(..., {grow: true})`
+in `app.js`), so a tall `--viewport` behaves the same way without a second
+code path. Node cards keep the crop: a card is a thumbnail, and one page's
+height is not a thumbnail.
+
+**Some pages can never be captured whole, and saying so is the feature.** An
+app shell — `html,body{height:100%;overflow:hidden}` with the content in an
+inner `overflow:auto` box, which is what any pinned sidebar or fixed header
+produces — never grows its *document* past the window, so `full_page=True` has
+nothing to reach for and correctly returns one viewport. The screenshot is then
+indistinguishable from that of a genuinely short page, which is how this turns
+into a bug report against `--full-page`. It is not one: the page really is one
+viewport tall. `_OVERFLOWS_JS` asks the page whether it is in this state (the
+document is not scrollable *and* an element inside it overflows past the
+document), `PageResult.scrolls_inside` carries the answer, and the summary
+names the affected paths — capped at `FOLD_ONLY_SHOWN`, because a hundred
+trapped pages are one fact rather than a hundred lines. Asked only when
+`--full-page` was asked for, and only reported for a capture that actually
+happened.
 
 ## Looking before writing
 
@@ -180,7 +228,9 @@ importing it, so that `--help` and shell completion do not pay for the
 Playwright import that the lazy command imports exist to avoid; a test fails if
 it drifts from `crawl.VIEWPORT_*`.
 
-The UI needs no special handling for a non-default viewport. Node cards use
+For a capture of the whole page rather than the fold, see `--full-page` above.
+
+Node cards use
 `object-fit: cover` with `object-position: top left`, so a portrait capture is
 cropped to the top of the page — a header-shaped thumbnail — rather than
 squashed. Verified by crawling the fixture at 390x844 and 1920x1080.

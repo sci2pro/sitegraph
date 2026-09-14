@@ -60,8 +60,22 @@ class FakeRenderer:
         return result
 
 
-def result(*hrefs: str, title: str = "Page", status: int = 200) -> PageResult:
-    return PageResult(status=status, title=title, hrefs=list(hrefs))
+def result(
+    *hrefs: str, title: str = "Page", status: int = 200, scrolls_inside: bool = False
+) -> PageResult:
+    return PageResult(
+        status=status, title=title, hrefs=list(hrefs), scrolls_inside=scrolls_inside
+    )
+
+
+def summary(out: str) -> str:
+    """The end-of-run notes, without the per-page progress above them.
+
+    The progress lines name the same paths as the caveats do, so a test asking
+    whether a path went *unmentioned* has to read the summary, not the stream.
+    """
+    start = out.rindex("Captured ")
+    return out[out.index("\n", start) :]
 
 
 def read_graph(directory: Path) -> dict:
@@ -766,6 +780,53 @@ def test_a_cap_reports_what_it_passed_over(
     out = capsys.readouterr().out
     assert "4 further page(s) of a route already seen" in out
     assert "--per-pattern" in out
+
+
+def test_pages_a_full_page_capture_could_not_reach_are_named(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """A shell layout puts the page inside its own scroller, so the document
+    never grows past the window and --full-page has nothing to reach for. The
+    screenshot then looks exactly like that of a short page, and the only
+    honest thing to do is say which pages those were."""
+    pages = {
+        ROOT: result("/shell", "/short"),
+        "http://example.com/shell": result(scrolls_inside=True),
+        "http://example.com/short": result(),
+    }
+    crawl(ROOT, tmp_path, 100, full_page=True, renderer=FakeRenderer(pages))
+
+    note = summary(capsys.readouterr().out)
+    assert "1 page(s) captured only down to the fold" in note
+    assert "  /shell" in note
+    assert "/short" not in note
+
+
+def test_fold_only_pages_are_listed_only_while_the_list_stays_useful(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """A hundred trapped pages are one fact, not a hundred lines of output."""
+    hrefs = [f"/shell/{n}" for n in range(8)]
+    pages = {ROOT: result(*hrefs)}
+    pages.update(
+        {f"http://example.com/shell/{n}": result(scrolls_inside=True) for n in range(8)}
+    )
+    crawl(ROOT, tmp_path, 100, full_page=True, renderer=FakeRenderer(pages))
+
+    note = summary(capsys.readouterr().out)
+    assert "8 page(s) captured only down to the fold" in note
+    assert note.count("  /shell/") == 5
+    assert "…and 3 more" in note
+
+
+def test_a_quiet_capture_says_nothing_about_folds(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """The note is a caveat, not a status line: no trapped pages, no mention."""
+    pages = {ROOT: result("/short"), "http://example.com/short": result()}
+    crawl(ROOT, tmp_path, 100, full_page=True, renderer=FakeRenderer(pages))
+
+    assert "fold" not in capsys.readouterr().out
 
 
 def test_a_cap_does_not_touch_pages_that_are_their_own_route(tmp_path: Path) -> None:

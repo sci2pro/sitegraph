@@ -474,6 +474,17 @@ body.inspecting main {
   display: block;
 }
 
+/* Set on the shot by app.js when the capture is taller than it is wide: the
+   picture is allowed its own height and the inspector scrolls to it, rather
+   than being cropped to its first few hundred pixels. */
+.insp-shot.tall {
+  height: auto;
+}
+
+.insp-shot.tall img {
+  height: auto;
+}
+
 .insp-body {
   padding: 12px 14px 20px;
 }

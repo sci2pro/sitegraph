@@ -93,6 +93,27 @@ PAGE_TIMEOUT_MS = 30_000
 #: Prefix for the throwaway directory a dry run renders into.
 DRY_RUN_PREFIX = "sitegraph-dry-run-"
 
+#: Whether a page's content is trapped inside a scrolling element — an app
+#: shell laid out `html,body{height:100%;overflow:hidden}` with the real
+#: content in an inner `overflow:auto` box. The document is then exactly as
+#: tall as the window, so `full_page=True` returns the viewport and the rest of
+#: the page is neither captured nor reachable by scrolling, because it is not
+#: the document that scrolls. Worth asking, because the result otherwise looks
+#: exactly like a page that simply is not very long.
+_OVERFLOWS_JS = """
+() => {
+  const documentHeight = document.documentElement.scrollHeight;
+  if (documentHeight > window.innerHeight + 1) return false;
+  if (!document.body) return false;
+  for (const element of document.body.querySelectorAll('*')) {
+    if (element.clientHeight > 0 && element.scrollHeight > element.clientHeight + 1) {
+      return element.scrollHeight > documentHeight + 1;
+    }
+  }
+  return false;
+}
+"""
+
 #: Raw ``href`` attributes would ignore a ``<base>`` element, so the resolved
 #: ``.href`` property is preferred. SVG anchors (which ``a[href]`` also matches)
 #: expose ``href`` as an object rather than a string, hence the guard — and the
@@ -119,6 +140,10 @@ class PageResult:
     hrefs: list[str] = field(default_factory=list)
     failed: bool = False
     error: str | None = None
+    #: The page's content lives in an element that scrolls, so the document is
+    #: only as tall as the window and a full-page capture cannot reach past the
+    #: fold. False whenever that could not be asked (see `_OVERFLOWS_JS`).
+    scrolls_inside: bool = False
 
 
 class Renderer(Protocol):
@@ -244,6 +269,7 @@ class ChromiumRenderer:
         storage_state: Path | None = None,
         session: SharedSession | None = None,
         capture: bool = True,
+        full_page: bool = False,
         viewport: tuple[int, int] = (VIEWPORT_WIDTH, VIEWPORT_HEIGHT),
         timeout_ms: int = PAGE_TIMEOUT_MS,
         settle_ms: int = SETTLE_TIMEOUT_MS,
@@ -262,6 +288,7 @@ class ChromiumRenderer:
         self._storage_state = Path(storage_state) if storage_state else None
         self._session = session
         self._capture = capture
+        self._full_page = full_page
         self._session_version = 0
         self._viewport = viewport
         self._timeout_ms = timeout_ms
@@ -363,6 +390,10 @@ class ChromiumRenderer:
                 except PlaywrightError:
                     pass
 
+                overflowing = self._full_page and self._capture and bool(
+                    page.evaluate(_OVERFLOWS_JS)
+                )
+
                 title = page.title()
                 hrefs = page.eval_on_selector_all("a[href]", _HREF_JS)
             except PlaywrightError as exc:
@@ -371,15 +402,28 @@ class ChromiumRenderer:
             # Taken last and guarded separately: the page is already fully
             # described by this point, so a capture that fails should cost the
             # thumbnail and nothing else.
+            captured = False
             if self._capture:
                 try:
                     page.screenshot(
-                        path=screenshot_path, type="webp", quality=SCREENSHOT_QUALITY
+                        path=screenshot_path,
+                        type="webp",
+                        quality=SCREENSHOT_QUALITY,
+                        full_page=self._full_page,
                     )
+                    captured = True
                 except PlaywrightError:
                     screenshot_path.unlink(missing_ok=True)
 
-            return PageResult(status=status, title=title, hrefs=hrefs)
+            return PageResult(
+                status=status,
+                title=title,
+                hrefs=hrefs,
+                # Only a complaint about a picture that exists: with no
+                # capture at all, "this one stops at the fold" would describe
+                # the wrong problem.
+                scrolls_inside=overflowing and captured,
+            )
         finally:
             try:
                 page.close()
@@ -736,6 +780,7 @@ def crawl(
     per_pattern: int | None = None,
     skip: Iterable[str] | None = None,
     dry_run: bool = False,
+    full_page: bool = False,
     storage_state: Path | None = None,
     renderer: Renderer | None = None,
     renderer_factory=None,
@@ -760,6 +805,13 @@ def crawl(
     also the size of every screenshot. Smaller is not a smaller picture of the
     same page — a narrow viewport gets the responsive layout, which is the
     point of asking for one. Defaults to spec §7's 1440x900.
+
+    *full_page* captures the whole scrollable page rather than the viewport, so
+    a long page is one tall image instead of its first 900 pixels. The viewport
+    still sets the width the page is laid out at; only the height of the
+    picture changes. Spec §7 calls full-page captures unnecessary for the first
+    version and it is not free — a long page is many times the pixels — but it
+    is the only way to see the whole of one.
 
     *per_pattern* caps how many pages are captured per route shape — one
     ``/courses/:id`` instead of five hundred. **This one is lossy**: a page
@@ -822,6 +874,7 @@ def crawl(
             storage_state=storage_state,
             session=session,
             capture=not dry_run,
+            full_page=full_page,
             viewport=size,
         )
 
@@ -910,12 +963,17 @@ def crawl(
     per_shape: Counter[str] = Counter()
     passed_over = 0
     skipped = 0
+    #: Pages a --full-page capture could not reach the bottom of, because
+    #: their content scrolls inside an element rather than as the document.
+    fold_only: list[str] = []
 
     def absorb(message: object) -> None:
         """Commit a finished page, if that is what *message* is."""
         nonlocal committed
         if not isinstance(message, _Completed):
             return
+        if message.result.scrolls_inside:
+            fold_only.append(message.job.url)
         in_flight.pop(message.job.seq, None)
         _commit(
             store,
@@ -961,7 +1019,16 @@ def crawl(
             store.write_graph(graph)
         print()
         if dry_run:
-            _dry_run_report(graph, committed, queue, started, len(in_flight), passed_over, skipped)
+            _dry_run_report(
+                graph,
+                committed,
+                queue,
+                started,
+                len(in_flight),
+                passed_over,
+                skipped,
+                fold_only,
+            )
             print(reason)
             discard_scratch()
             raise SystemExit(code)
@@ -1055,12 +1122,19 @@ def crawl(
     # still holding browsers open until they are told to stop.
     teardown()
     if dry_run:
-        _dry_run_report(graph, committed, queue, started, 0, passed_over, skipped)
+        _dry_run_report(graph, committed, queue, started, 0, passed_over, skipped, fold_only)
         print("\nRun it again without --dry-run to write the results.")
         discard_scratch()
         return
     _report(
-        graph, output, committed, queue, started, passed_over=passed_over, skipped=skipped
+        graph,
+        output,
+        committed,
+        queue,
+        started,
+        passed_over=passed_over,
+        skipped=skipped,
+        fold_only=fold_only,
     )
     print(f"\nExplore with:  sitegraph serve --dir {output}")
 
@@ -1145,6 +1219,11 @@ VOLUME_SUGGEST_PAGES = 5
 #: How many routes the report will list.
 VOLUME_SHOWN = 10
 
+#: How many fold-only paths to name before summarising the rest. Enough to
+#: recognise a layout that does it (usually the whole app shell), not so many
+#: that the summary becomes a list.
+FOLD_ONLY_SHOWN = 5
+
 
 def _skip_hint(shape: str) -> str | None:
     """The literal ``--skip`` that would leave *shape* alone, if there is one.
@@ -1171,6 +1250,7 @@ def _dry_run_report(
     abandoned: int,
     passed_over: int,
     skipped: int,
+    fold_only: list[str],
 ) -> None:
     """Say what a crawl would have produced, and what looks expensive.
 
@@ -1213,7 +1293,7 @@ def _dry_run_report(
             if hint:
                 print(f"  --skip {hint:<14} leave the route out of the crawl")
 
-    _caveats(graph, queue, abandoned, passed_over, skipped)
+    _caveats(graph, queue, abandoned, passed_over, skipped, fold_only)
 
 
 def _caveats(
@@ -1222,6 +1302,7 @@ def _caveats(
     abandoned: int,
     passed_over: int,
     skipped: int,
+    fold_only: list[str],
 ) -> None:
     """The pages a run did not capture, each for its own reason.
 
@@ -1262,6 +1343,21 @@ def _caveats(
             f"uncaptured (--per-pattern); raise it and --resume to take them."
         )
 
+    if fold_only:
+        # Not a failure and not fixable by a flag: the page really is only as
+        # tall as the window, and the rest of it is inside a scrolling element
+        # that a full-page capture cannot follow. Said out loud because the
+        # alternative is a user reading a short screenshot as a bug in
+        # --full-page, which is exactly what happened.
+        print(
+            f"{len(fold_only)} page(s) captured only down to the fold: their "
+            f"content scrolls inside an element, which --full-page cannot reach."
+        )
+        for url in fold_only[:FOLD_ONLY_SHOWN]:
+            print(f"  {_display(url)}")
+        if len(fold_only) > FOLD_ONLY_SHOWN:
+            print(f"  …and {len(fold_only) - FOLD_ONLY_SHOWN} more")
+
 
 def _report(
     graph: Graph,
@@ -1272,6 +1368,7 @@ def _report(
     abandoned: int = 0,
     passed_over: int = 0,
     skipped: int = 0,
+    fold_only: list[str] | None = None,
 ) -> None:
     """Print the end-of-crawl summary.
 
@@ -1289,4 +1386,4 @@ def _report(
         f"\nCaptured {visited} page(s) in {elapsed:.1f}s — "
         f"{len(graph)} in total, {len(graph.edges())} edge(s) → {output}"
     )
-    _caveats(graph, queue, abandoned, passed_over, skipped)
+    _caveats(graph, queue, abandoned, passed_over, skipped, fold_only or [])

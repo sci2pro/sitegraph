@@ -432,6 +432,140 @@ def test_folding_is_invisible_on_a_site_without_identifiers(
     assert problems == []
 
 
+def tall_page(blocks: int = 6) -> str:
+    """A page several screens long, which is what --full-page is for."""
+    body = "".join(
+        f"<section style='height:600px;background:#eef'>Section {i}</section>"
+        for i in range(blocks)
+    )
+    return (
+        "<!doctype html><html><head><meta charset='utf-8'><title>Tall</title>"
+        f"</head><body>{body}</body></html>"
+    )
+
+
+def only_shot(directory: Path) -> dict:
+    node = json.loads((directory / GRAPH_FILE).read_text())["nodes"][0]
+    return measure(directory / node["screenshot"])
+
+
+def test_a_full_page_capture_is_as_tall_as_the_page(tmp_path: Path) -> None:
+    """The whole point: a long page arrives as one tall image instead of its
+    first screenful, while the viewport still decides the width."""
+    with run_site({"/": tall_page(), "/short": "<!doctype html><title>Short</title>hi"}) as site:
+        viewport_dir = tmp_path / "viewport"
+        full_dir = tmp_path / "full"
+        crawl(site, viewport_dir, 5, viewport=(800, 600), workers=1)
+        crawl(site, full_dir, 5, viewport=(800, 600), workers=1, full_page=True)
+
+    cropped = only_shot(viewport_dir)
+    whole = only_shot(full_dir)
+
+    assert (cropped["width"], cropped["height"]) == (800, 600)
+    assert whole["width"] == 800, "the viewport still sets the width laid out at"
+    assert whole["height"] > 3000, "the page is six screens long"
+    assert whole["ink"] > cropped["ink"], "and there is more of it to look at"
+
+
+def test_a_page_shorter_than_the_viewport_is_unchanged(tmp_path: Path) -> None:
+    """Nothing to scroll means nothing extra: a full-page capture of a short
+    page is the viewport, not a sliver."""
+    with run_site({"/": "<!doctype html><title>Short</title><p>hi"}) as site:
+        crawl(site, tmp_path / "out", 5, viewport=(800, 600), workers=1, full_page=True)
+
+    assert (only_shot(tmp_path / "out")["width"], only_shot(tmp_path / "out")["height"]) == (800, 600)
+
+
+def shell_page() -> str:
+    """An app shell: the window is the frame, and the content scrolls inside it.
+
+    This is what every layout that pins a sidebar or a header looks like, and it
+    defeats --full-page in a way that leaves no trace in the screenshot — the
+    document really is one viewport tall, so there is nothing to capture. The
+    page is three screens of content; the picture is one.
+    """
+    blocks = "".join(
+        f"<section style='height:600px;background:#efe'>Section {i}</section>"
+        for i in range(6)
+    )
+    return (
+        "<!doctype html><html><head><meta charset='utf-8'><title>Shell</title>"
+        "<style>html,body{height:100%;margin:0;overflow:hidden}"
+        "#scroller{height:100%;overflow:auto}</style></head>"
+        f"<body><div id='scroller'>{blocks}</div></body></html>"
+    )
+
+
+def test_content_trapped_in_a_scroller_is_reported_not_silently_cropped(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """The honest failure mode of --full-page: some layouts cannot be captured
+    whole, and the result is indistinguishable from a short page — so it has to
+    be said, by name, at the end of the crawl."""
+    pages = {
+        "/": f"<!doctype html><title>Home</title><a href='/shell'>shell</a>"
+        f"<a href='/tall'>tall</a>",
+        "/shell": shell_page(),
+        "/tall": tall_page(),
+    }
+    with run_site(pages) as site:
+        output = tmp_path / "out"
+        crawl(site, output, 5, viewport=(800, 600), workers=1, full_page=True)
+
+    out = capsys.readouterr().out
+    assert "1 page(s) captured only down to the fold" in out
+    assert "/shell" in out
+    assert "/tall" not in out[out.index("down to the fold") :]
+
+    shots = {
+        node["url"].removeprefix(site): measure(output / node["screenshot"])
+        for node in json.loads((output / GRAPH_FILE).read_text())["nodes"]
+    }
+    # Not a bug in the flag: the page it could not reach is genuinely one
+    # viewport tall, and the one beside it — same crawl, same flags — is not.
+    assert shots["/shell"]["height"] == 600, "nothing to scroll, nothing to capture"
+    assert shots["/tall"]["height"] > 3000, "the ordinary long page still works"
+
+
+def test_a_tall_capture_is_reachable_in_the_inspector(tmp_path: Path) -> None:
+    """A capture taller than the box it is shown in would be cropped to a
+    sliver by `cover` — which is the thing --full-page was asked for. The
+    inspector lets it take its own height and scrolls; the card stays a
+    thumbnail."""
+    with run_site({"/": tall_page()}) as site:
+        output = tmp_path / "out"
+        crawl(site, output, 5, viewport=(800, 600), workers=1, full_page=True)
+
+        with running(output) as port:
+            with sync_playwright() as playwright:
+                browser = playwright.chromium.launch()
+                page = browser.new_page(viewport={"width": 1300, "height": 850})
+                problems = watch(page)
+                try:
+                    page.goto(f"http://127.0.0.1:{port}/", wait_until="load")
+                    page.wait_for_selector(".node", timeout=15_000)
+                    page.wait_for_timeout(1500)
+
+                    shot = page.locator("#inspector .insp-shot")
+                    assert shot.count() == 1
+                    assert shot.get_attribute("class").endswith("tall")
+                    box = shot.bounding_box()
+                    assert box["height"] > 800, "the picture should be shown whole"
+
+                    scrolled = page.evaluate("""() => {
+                      const el = document.getElementById('inspector');
+                      return [el.scrollHeight, el.clientHeight];
+                    }""")
+                    assert scrolled[0] > scrolled[1], "the inspector should scroll"
+
+                    card = page.locator(".node .thumb").first.bounding_box()
+                    assert card["height"] < 120, "a card is still a thumbnail"
+                finally:
+                    browser.close()
+
+    assert problems == []
+
+
 def test_a_real_dry_run_writes_nothing(site: str, tmp_path: Path) -> None:
     """The promise, against a real browser and a real site: the same walk, and
     not one file."""

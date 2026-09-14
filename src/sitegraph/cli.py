@@ -132,6 +132,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     crawl.add_argument(
+        "--full-page",
+        action="store_true",
+        help=(
+            "capture the whole scrollable page rather than just the viewport, "
+            "so a long page is one tall image instead of its first 900 pixels. "
+            "--viewport still sets the width it is laid out at"
+        ),
+    )
+    crawl.add_argument(
         "--dry-run",
         action="store_true",
         help=(
@@ -217,6 +226,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 per_pattern=args.per_pattern,
                 skip=args.skip,
                 dry_run=args.dry_run,
+                full_page=args.full_page,
                 output=Path(args.output),
                 max_pages=args.max_pages,
                 resume=args.resume,

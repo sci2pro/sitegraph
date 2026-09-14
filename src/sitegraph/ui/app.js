@@ -118,8 +118,17 @@ function matches(node) {
   );
 }
 
-/** A thumbnail, or a hatched placeholder when there is no screenshot to show. */
-function thumb(node, className) {
+/** A thumbnail, or a hatched placeholder when there is no screenshot to show.
+ *
+ * ``grow`` is for the inspector, where the picture is the point. A capture
+ * taller than it is wide is otherwise cropped to its top sliver by
+ * `object-fit: cover` in a box shaped like a screen, which is the thing a
+ * full-page capture was meant to avoid — so it takes its own height and the
+ * inspector scrolls. Asked of the image rather than of the graph, so a tall
+ * `--viewport` behaves the same way as `--full-page`. Node cards keep the
+ * crop: a card is a thumbnail and one page's height is not a thumbnail.
+ */
+function thumb(node, className, { grow = false } = {}) {
   const box = el("div", { class: className });
   if (node.screenshot) {
     const img = el("img", {
@@ -134,6 +143,11 @@ function thumb(node, className) {
       img.remove();
       box.append(el("div", { class: "shot-missing", text: "no screenshot" }));
     });
+    if (grow) {
+      img.addEventListener("load", () => {
+        if (img.naturalHeight > img.naturalWidth) box.classList.add("tall");
+      });
+    }
     box.append(img);
   } else {
     box.append(
@@ -735,7 +749,7 @@ async function openInspector(id) {
   const head = el(
     "div",
     { class: "insp-head" },
-    thumb(node, "insp-shot"),
+    thumb(node, "insp-shot", { grow: true }),
     el("button", {
       class: "insp-close",
       text: "×",

@@ -144,6 +144,18 @@ def test_crawl_rejects_an_unusable_skip_pattern(value: str) -> None:
         build_parser().parse_args(["crawl", "http://x/", "--skip", value])
 
 
+def test_crawl_captures_the_viewport_by_default() -> None:
+    args = build_parser().parse_args(["crawl", "http://localhost:3000"])
+
+    assert args.full_page is False
+
+
+def test_crawl_accepts_a_full_page_capture() -> None:
+    args = build_parser().parse_args(["crawl", "http://x/", "--full-page"])
+
+    assert args.full_page is True
+
+
 def test_crawl_is_not_a_dry_run_by_default() -> None:
     args = build_parser().parse_args(["crawl", "http://localhost:3000"])
 
