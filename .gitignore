@@ -25,3 +25,5 @@ claude_env.sh
 .DS_Store
 /.sentinel-sitegraph/
 /.sitegraph-sentinel/
+/.sitegraph-python-docs/
+/.sitegraph-python-docs-partial/
