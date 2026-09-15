@@ -221,8 +221,13 @@ because the claims worth checking here are about what a browser actually does.
 `spec.md` is the design contract, and `CLAUDE.md` records the decisions and the
 measurements behind them.
 
+## How this was built
+
+Developed with DeepSeek-v4.1-Flash through the Claude Code CLI, driven from
+the T3 desktop app.
+
 ## License
 
-No license has been chosen yet. Until one is added, the default is all rights
-reserved, which means this is not open source in the legal sense despite being
-publicly readable.
+Apache License 2.0. See [LICENSE](LICENSE) for the full text.
+
+Copyright 2026 sci2pro.
