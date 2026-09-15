@@ -9,13 +9,14 @@ hard to aim at a specific case. The real browser is covered separately by
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from pathlib import Path
 
 import pytest
 
 from sitegraph.crawl import PageResult, ResumeError, crawl
-from sitegraph.store import GRAPH_FILE, PAGES_DIR, SCREENSHOTS_DIR
+from sitegraph.store import GRAPH_FILE, PAGES_DIR, SCREENSHOTS_DIR, THUMBS_DIR
 
 ROOT = "http://example.com/"
 
@@ -35,10 +36,12 @@ class FakeRenderer:
         *,
         on_visit=None,
         screenshots: bool = True,
+        thumbnails: bool = True,
     ) -> None:
         self.pages = pages
         self.on_visit = on_visit
         self.screenshots = screenshots
+        self.thumbnails = thumbnails
         self.visited: list[str] = []
         self.closed = False
 
@@ -57,6 +60,10 @@ class FakeRenderer:
             return PageResult(failed=True, error="net::ERR_NAME_NOT_RESOLVED")
         if not result.failed and self.screenshots:
             screenshot_path.write_bytes(WEBP_MAGIC)
+        if not result.failed and self.thumbnails and not result.thumbnail:
+            # A real renderer hands back the card-sized copy in the result, so
+            # the fake does too — it is the same bytes-in-memory route.
+            result = dataclasses.replace(result, thumbnail=WEBP_MAGIC)
         return result
 
 
@@ -410,6 +417,62 @@ def test_screenshot_paths_in_the_graph_are_relative(tmp_path: Path) -> None:
     for node in read_graph(tmp_path)["nodes"]:
         assert node["screenshot"] == f"screenshots/{node['id']}.webp"
         assert not node["screenshot"].startswith("/")
+
+
+def test_a_captured_page_gets_a_card_sized_copy(tmp_path: Path) -> None:
+    """The graph view draws node cards from the copy rather than decoding a
+    full capture per card, so each rendered page leaves one behind."""
+    pages = {ROOT: result("/a"), "http://example.com/a": result()}
+    crawl(ROOT, tmp_path, 100, renderer=FakeRenderer(pages))
+
+    for node in read_graph(tmp_path)["nodes"]:
+        assert node["thumb"] == f"thumbs/{node['id']}.webp"
+        assert (tmp_path / node["thumb"]).is_file()
+        assert not node["thumb"].startswith("/")
+
+
+def test_a_page_with_no_capture_gets_no_copy(tmp_path: Path) -> None:
+    """A copy of a picture that does not exist would be a graph entry pointing
+    at nothing."""
+    pages = {ROOT: result("/broken"), "http://example.com/broken": result(title="x")}
+    pages["http://example.com/broken"] = PageResult(failed=True, error="boom")
+    crawl(ROOT, tmp_path, 100, renderer=FakeRenderer(pages))
+
+    broken = nodes_by_url(tmp_path)["http://example.com/broken"]
+    assert broken["failed"] is True
+    assert broken["screenshot"] is None
+    assert "thumb" not in broken
+    assert not (tmp_path / THUMBS_DIR / "000002.webp").exists()
+
+
+def test_a_crawl_that_made_no_copies_names_none(tmp_path: Path) -> None:
+    """Absent means "draw the capture instead", which is what every directory
+    written before copies existed has to mean."""
+    pages = {ROOT: result("/a"), "http://example.com/a": result()}
+    crawl(ROOT, tmp_path, 100, renderer=FakeRenderer(pages, thumbnails=False))
+
+    for node in read_graph(tmp_path)["nodes"]:
+        assert "thumb" not in node
+        assert node["screenshot"]
+    assert list((tmp_path / THUMBS_DIR).glob("*")) == []
+
+
+def test_a_dry_run_writes_no_copies(tmp_path: Path) -> None:
+    output = tmp_path / "out"
+    crawl(ROOT, output, 100, dry_run=True, renderer=FakeRenderer({ROOT: result("/a")}))
+
+    assert not (output / THUMBS_DIR).exists()
+
+
+def test_resume_leaves_copies_it_already_made_alone(tmp_path: Path) -> None:
+    pages = chain(*FIVE)
+    crawl(ROOT, tmp_path, 2, renderer=FakeRenderer(pages))
+    first = (tmp_path / THUMBS_DIR / "000001.webp").read_bytes()
+
+    crawl(ROOT, tmp_path, 10, resume=True, renderer=FakeRenderer(pages))
+
+    assert (tmp_path / THUMBS_DIR / "000001.webp").read_bytes() == first
+    assert len(list((tmp_path / THUMBS_DIR).glob("*.webp"))) == 5
 
 
 def test_output_directory_is_created(tmp_path: Path) -> None:
@@ -826,7 +889,9 @@ def test_a_quiet_capture_says_nothing_about_folds(
     pages = {ROOT: result("/short"), "http://example.com/short": result()}
     crawl(ROOT, tmp_path, 100, full_page=True, renderer=FakeRenderer(pages))
 
-    assert "fold" not in capsys.readouterr().out
+    # The exact sentence, not the word: pytest's tmp_path is under a directory
+    # called "folders", which a bare "fold" would match.
+    assert "down to the fold" not in capsys.readouterr().out
 
 
 def test_a_cap_does_not_touch_pages_that_are_their_own_route(tmp_path: Path) -> None:

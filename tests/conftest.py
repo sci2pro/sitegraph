@@ -7,11 +7,15 @@ from pathlib import Path
 
 import pytest
 
-from sitegraph.store import GRAPH_FILE, PAGES_DIR, SCREENSHOTS_DIR
+from sitegraph.store import GRAPH_FILE, PAGES_DIR, SCREENSHOTS_DIR, THUMBS_DIR
 
 #: A valid crawl of a three-page site, one of which failed to render. Written
 #: by hand rather than produced by a crawl so that tests of the *reader* do not
 #: depend on the writer.
+#:
+#: ``thumb`` is present on the two rendered pages and absent on the failed one,
+#: which is exactly how the writer emits it — a page with no picture of its own
+#: has no card-sized copy either.
 GRAPH = {
     "root": "000001",
     "nodes": [
@@ -23,6 +27,7 @@ GRAPH = {
             "status": 200,
             "failed": False,
             "screenshot": "screenshots/000001.webp",
+            "thumb": "thumbs/000001.webp",
         },
         {
             "id": "000002",
@@ -32,6 +37,7 @@ GRAPH = {
             "status": 200,
             "failed": False,
             "screenshot": "screenshots/000002.webp",
+            "thumb": "thumbs/000002.webp",
         },
         {
             "id": "000003",
@@ -100,6 +106,7 @@ def crawl_dir(tmp_path: Path) -> Path:
     directory = tmp_path / ".sitegraph"
     (directory / PAGES_DIR).mkdir(parents=True)
     (directory / SCREENSHOTS_DIR).mkdir(parents=True)
+    (directory / THUMBS_DIR).mkdir(parents=True)
     (directory / GRAPH_FILE).write_text(json.dumps(GRAPH), encoding="utf-8")
 
     for node_id, record in PAGES.items():
@@ -108,5 +115,6 @@ def crawl_dir(tmp_path: Path) -> Path:
         )
     for node_id in ("000001", "000002"):
         (directory / SCREENSHOTS_DIR / f"{node_id}.webp").write_bytes(TINY_WEBP)
+        (directory / THUMBS_DIR / f"{node_id}.webp").write_bytes(TINY_WEBP)
 
     return directory

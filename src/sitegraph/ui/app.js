@@ -127,12 +127,25 @@ function matches(node) {
  * inspector scrolls. Asked of the image rather than of the graph, so a tall
  * `--viewport` behaves the same way as `--full-page`. Node cards keep the
  * crop: a card is a thumbnail and one page's height is not a thumbnail.
+ *
+ * ``full`` asks for the capture itself rather than the card-sized copy, and
+ * only the inspector does. An `<img>` decodes at its intrinsic size whatever
+ * it is painted at, so pointing a few hundred cards at full captures means the
+ * browser decodes a few hundred 1440x900 images to paint each one the size of
+ * a full stop — measured at a 251ms worst frame and 792ms of blocked main
+ * thread on 500 routes. The copy costs nothing to draw and, at the size a card
+ * is actually shown, is what the card was showing anyway.
+ *
+ * A crawl made before these existed has no ``thumb``, and falls back to the
+ * full capture: slower, and still correct. Asking for the copy unconditionally
+ * would 404 at a file that was never written.
  */
-function thumb(node, className, { grow = false } = {}) {
+function thumb(node, className, { grow = false, full = false } = {}) {
   const box = el("div", { class: className });
-  if (node.screenshot) {
+  const source = full ? node.screenshot : node.thumb || node.screenshot;
+  if (source) {
     const img = el("img", {
-      src: node.screenshot,
+      src: source,
       alt: "",
       loading: "lazy",
       draggable: "false",
@@ -749,7 +762,7 @@ async function openInspector(id) {
   const head = el(
     "div",
     { class: "insp-head" },
-    thumb(node, "insp-shot", { grow: true }),
+    thumb(node, "insp-shot", { grow: true, full: true }),
     el("button", {
       class: "insp-close",
       text: "×",

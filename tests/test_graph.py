@@ -224,6 +224,47 @@ def test_a_plain_page_carries_no_shape_in_the_payload() -> None:
     )
 
 
+def test_a_page_with_a_thumbnail_says_where_it_is() -> None:
+    """The graph view loads the card-sized copy and the inspector loads the
+    capture, so the payload has to name both."""
+    graph = Graph()
+    graph.add_page(
+        "http://example.com/",
+        screenshot="screenshots/000001.webp",
+        thumb="thumbs/000001.webp",
+    )
+
+    node = graph.to_dict()["nodes"][0]
+    assert node["screenshot"] == "screenshots/000001.webp"
+    assert node["thumb"] == "thumbs/000001.webp"
+
+
+def test_a_page_without_a_thumbnail_carries_no_thumb_in_the_payload() -> None:
+    """Absent means "fall back to the screenshot", which is what every crawl
+    made before thumbnails existed has to mean. Written as an absence rather
+    than a null so that those crawls produce exactly the payload they produced
+    before, the same way an unparameterised URL carries no `shape`."""
+    graph = Graph()
+    graph.add_page("http://example.com/", screenshot="screenshots/000001.webp")
+    graph.add_page("http://example.com/broken", failed=True, screenshot=None)
+
+    for node in graph.to_dict()["nodes"]:
+        assert "thumb" not in node, node
+
+
+def test_the_page_record_keeps_the_capture_and_not_the_copy() -> None:
+    """The record is what the inspector reads, and the inspector shows the
+    page, not the card."""
+    graph = Graph()
+    node = graph.add_page(
+        "http://example.com/",
+        screenshot="screenshots/000001.webp",
+        thumb="thumbs/000001.webp",
+    )
+
+    assert "thumb" not in graph.page_dict(node)
+
+
 def test_failed_pages_stay_in_the_graph() -> None:
     """Spec §7: a page that fails to render is still a node, marked failed."""
     graph = Graph()

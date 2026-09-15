@@ -6,9 +6,10 @@ browser UI read it, and a user may reasonably look at it by hand::
     .sitegraph/
     ├── graph.json          # whole graph; independent of the per-page files
     ├── pages/000001.json   # one record per page
-    └── screenshots/
-        ├── 000001.webp
-        └── .incoming/      # transient; see INCOMING_DIR below
+    ├── screenshots/
+    │   ├── 000001.webp
+    │   └── .incoming/      # transient; see INCOMING_DIR below
+    └── thumbs/000001.webp  # card-sized copy of the screenshot
 
 The filenames live here so that the writer (`crawl`) and the readers (`serve`,
 the UI) cannot drift apart. Paths stored *inside* the data — a node's
@@ -32,17 +33,33 @@ __all__ = [
     "PAGES_DIR",
     "SCREENSHOTS_DIR",
     "SCREENSHOT_EXT",
+    "THUMBS_DIR",
     "CrawlStore",
     "CrawlNotFound",
     "load_graph",
     "page_filename",
     "screenshot_filename",
+    "thumbnail_filename",
 ]
 
 GRAPH_FILE = "graph.json"
 PAGES_DIR = "pages"
 SCREENSHOTS_DIR = "screenshots"
 SCREENSHOT_EXT = "webp"
+
+#: Card-sized copies of the screenshots, for the graph and the contact sheet.
+#:
+#: A graph of several hundred nodes draws each card at a few screen pixels, but
+#: an `<img>` decodes at its *intrinsic* size whatever it is painted at — so
+#: pointing those cards at the full capture made the browser decode hundreds of
+#: 1440x900 images to paint them the size of a full stop, and the interface
+#: stalled in bursts while it did. Measured on 500 routes: full captures cost a
+#: 251ms worst frame and 792ms of blocked main thread, card-sized ones zero.
+#:
+#: Kept in its own directory rather than beside the screenshots so that the two
+#: remain separately enumerable: `screenshots/` is exactly one file per rendered
+#: page, which is a property the tests and `--resume` both rely on.
+THUMBS_DIR = "thumbs"
 
 #: Where workers drop a capture before its node exists. A concurrent crawl has
 #: to render a page before it can know the page's ID, and the ID is positional,
@@ -64,6 +81,11 @@ def page_filename(node_id: str) -> str:
 
 def screenshot_filename(node_id: str) -> str:
     """Return the screenshot's filename for *node_id*."""
+    return f"{node_id}.{SCREENSHOT_EXT}"
+
+
+def thumbnail_filename(node_id: str) -> str:
+    """Return the graph thumbnail's filename for *node_id*."""
     return f"{node_id}.{SCREENSHOT_EXT}"
 
 
@@ -121,6 +143,7 @@ class CrawlStore:
         """Create the output tree. Safe to call on an existing directory."""
         (self.directory / PAGES_DIR).mkdir(parents=True, exist_ok=True)
         (self.directory / SCREENSHOTS_DIR).mkdir(parents=True, exist_ok=True)
+        (self.directory / THUMBS_DIR).mkdir(parents=True, exist_ok=True)
         self.sweep_incoming()
 
     def incoming_path(self, token: int) -> Path:
@@ -169,6 +192,27 @@ class CrawlStore:
     def screenshot_rel(self, node_id: str) -> str:
         """The screenshot path as stored in the data, relative to the output."""
         return f"{SCREENSHOTS_DIR}/{screenshot_filename(node_id)}"
+
+    def thumbnail_path(self, node_id: str) -> Path:
+        """Absolute path to write *node_id*'s thumbnail to."""
+        return self.directory / THUMBS_DIR / thumbnail_filename(node_id)
+
+    def thumbnail_rel(self, node_id: str) -> str:
+        """The thumbnail path as stored in the data, relative to the output."""
+        return f"{THUMBS_DIR}/{thumbnail_filename(node_id)}"
+
+    def write_thumbnail(self, node_id: str, data: bytes) -> None:
+        """Write *node_id*'s thumbnail, atomically.
+
+        The bytes arrive from the renderer rather than from a scratch file, so
+        this is the one write in the crawl that has no `os.replace` to inherit
+        — hence its own temporary file, for the same reason: a crawl killed
+        mid-write must not leave a half-image for the graph to point at.
+        """
+        path = self.thumbnail_path(node_id)
+        tmp = path.with_name(f"{path.name}.tmp")
+        tmp.write_bytes(data)
+        os.replace(tmp, path)
 
     def write_page(self, record: dict) -> None:
         """Write one page record to ``pages/``."""

@@ -21,10 +21,12 @@ from sitegraph.store import (
     GRAPH_FILE,
     PAGES_DIR,
     SCREENSHOTS_DIR,
+    THUMBS_DIR,
     CrawlNotFound,
     load_graph,
     page_filename,
     screenshot_filename,
+    thumbnail_filename,
 )
 
 __all__ = ["HOST", "UIServer", "make_server", "serve"]
@@ -48,6 +50,7 @@ UI_DIR = Path(__file__).parent / "ui"
 # simply fails to match rather than being sanitized.
 _PAGE_ROUTE = re.compile(r"\A/pages/(?P<id>\d{1,12})\.json\Z")
 _SHOT_ROUTE = re.compile(r"\A/screenshots/(?P<name>[0-9A-Za-z._-]{1,80}\.webp)\Z")
+_THUMB_ROUTE = re.compile(r"\A/thumbs/(?P<name>[0-9A-Za-z._-]{1,80}\.webp)\Z")
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -86,6 +89,17 @@ class _Handler(BaseHTTPRequestHandler):
                 match["name"][: -len(".webp")]
             )
             self._send_file(shot, "image/webp")
+            return
+
+        match = _THUMB_ROUTE.match(path)
+        if match:
+            # Same re-derivation, same reasoning as the screenshot above. A
+            # crawl made before thumbnails existed has none of these files, and
+            # the graph does not name one, so nothing asks for them.
+            thumb = self.directory / THUMBS_DIR / thumbnail_filename(
+                match["name"][: -len(".webp")]
+            )
+            self._send_file(thumb, "image/webp")
             return
 
         self._not_found(f"no route for {path}")

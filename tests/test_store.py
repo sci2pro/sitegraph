@@ -17,11 +17,13 @@ from sitegraph.store import (
     GRAPH_FILE,
     PAGES_DIR,
     SCREENSHOTS_DIR,
+    THUMBS_DIR,
     CrawlNotFound,
     CrawlStore,
     load_graph,
     page_filename,
     screenshot_filename,
+    thumbnail_filename,
 )
 
 
@@ -36,6 +38,7 @@ def test_store_creates_the_documented_tree(tmp_path: Path) -> None:
     assert (tmp_path / ".sitegraph" / GRAPH_FILE).is_file()
     assert (tmp_path / ".sitegraph" / PAGES_DIR / "000001.json").is_file()
     assert (tmp_path / ".sitegraph" / SCREENSHOTS_DIR).is_dir()
+    assert (tmp_path / ".sitegraph" / THUMBS_DIR).is_dir()
 
 
 def test_create_is_idempotent(tmp_path: Path) -> None:
@@ -49,6 +52,7 @@ def test_create_is_idempotent(tmp_path: Path) -> None:
 def test_filenames_are_zero_padded(tmp_path: Path) -> None:
     assert page_filename("000012") == "000012.json"
     assert screenshot_filename("000012") == "000012.webp"
+    assert thumbnail_filename("000012") == "000012.webp"
 
 
 def test_screenshot_paths_are_relative_to_the_output_directory() -> None:
@@ -60,6 +64,8 @@ def test_screenshot_paths_are_relative_to_the_output_directory() -> None:
     assert store.screenshot_path("000007") == Path(
         "/tmp/somewhere/screenshots/000007.webp"
     )
+    assert store.thumbnail_rel("000007") == "thumbs/000007.webp"
+    assert store.thumbnail_path("000007") == Path("/tmp/somewhere/thumbs/000007.webp")
 
 
 def test_the_scratch_directory_is_swept_on_create(tmp_path: Path) -> None:
@@ -94,6 +100,40 @@ def test_a_capture_that_never_landed_is_reported(tmp_path: Path) -> None:
     store.create()
 
     assert store.adopt_screenshot(store.incoming_path(1), "000012") is False
+
+
+def test_a_thumbnail_is_written_where_the_graph_says_it_is(tmp_path: Path) -> None:
+    """The bytes come from the renderer rather than from a scratch file, so this
+    is the one image write with no `os.replace` to inherit — it has to land
+    under the name `thumbnail_rel` promises."""
+    store = CrawlStore(tmp_path / "out")
+    store.create()
+
+    store.write_thumbnail("000012", b"a small picture")
+
+    assert store.thumbnail_path("000012").read_bytes() == b"a small picture"
+    assert (tmp_path / "out" / store.thumbnail_rel("000012")).is_file()
+
+
+def test_a_thumbnail_write_never_leaves_a_half_file(tmp_path: Path) -> None:
+    """A killed crawl must not leave a truncated image for the graph to point at."""
+    store = CrawlStore(tmp_path / "out")
+    store.create()
+
+    store.write_thumbnail("000012", b"first")
+
+    assert not list((tmp_path / "out" / THUMBS_DIR).glob("*.tmp"))
+    assert store.thumbnail_path("000012").read_bytes() == b"first"
+
+
+def test_thumbnails_are_kept_out_of_the_screenshots_directory(tmp_path: Path) -> None:
+    """`screenshots/` is exactly one file per rendered page — a property the
+    tests and `--resume` both count on — so the copies live beside it."""
+    store = CrawlStore(tmp_path / "out")
+    store.create()
+    store.write_thumbnail("000012", b"a small picture")
+
+    assert list((tmp_path / "out" / SCREENSHOTS_DIR).glob("*.webp")) == []
 
 
 def test_json_is_written_atomically(tmp_path: Path) -> None:

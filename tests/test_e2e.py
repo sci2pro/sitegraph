@@ -20,10 +20,11 @@ import pytest
 from fixture_site import _page, run_site
 from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import sync_playwright
+from conftest import TINY_WEBP
 from serving import request, running
 
-from sitegraph.crawl import VIEWPORT_HEIGHT, VIEWPORT_WIDTH, crawl
-from sitegraph.store import GRAPH_FILE, PAGES_DIR, SCREENSHOTS_DIR
+from sitegraph.crawl import THUMB_WIDTH, VIEWPORT_HEIGHT, VIEWPORT_WIDTH, crawl
+from sitegraph.store import GRAPH_FILE, PAGES_DIR, SCREENSHOTS_DIR, THUMBS_DIR
 
 pytestmark = pytest.mark.e2e
 
@@ -527,6 +528,59 @@ def test_content_trapped_in_a_scroller_is_reported_not_silently_cropped(
     assert shots["/tall"]["height"] > 3000, "the ordinary long page still works"
 
 
+def test_every_captured_page_leaves_a_card_sized_copy(tmp_path: Path) -> None:
+    """The graph view draws node cards from a copy of the capture, because an
+    `<img>` decodes at its intrinsic size whatever it is painted at — so a few
+    hundred cards pointed at full captures make the browser decode a few
+    hundred 1440x900 images to paint each one the size of a full stop."""
+    with run_site() as site:
+        output = tmp_path / "out"
+        crawl(site, output, 100, workers=1)
+
+    graph = json.loads((output / GRAPH_FILE).read_text())
+    rendered = [node for node in graph["nodes"] if not node["failed"]]
+    assert rendered
+
+    for node in rendered:
+        assert node["thumb"] == f"thumbs/{node['id']}.webp"
+        assert (output / node["thumb"]).is_file()
+    assert len(list((output / THUMBS_DIR).glob("*.webp"))) == len(rendered)
+
+    # The failed page is the exception, and the reasons are the same ones that
+    # leave it without a capture.
+    failed = [node for node in graph["nodes"] if node["failed"]]
+    assert failed and all("thumb" not in node for node in failed)
+
+    # A miniature of the page, not a blank frame — and small enough that the
+    # saving is real rather than nominal.
+    sample = rendered[0]
+    copy_of = measure(output / sample["thumb"])
+    capture = measure(output / sample["screenshot"])
+    assert copy_of["width"] == THUMB_WIDTH
+    assert copy_of["ink"] > 0, "the copy appears to be blank"
+    assert copy_of["height"] < capture["height"]
+    assert (output / sample["thumb"]).stat().st_size < (
+        output / sample["screenshot"]
+    ).stat().st_size
+
+
+def test_a_copy_of_a_full_page_capture_still_crops_to_the_top(tmp_path: Path) -> None:
+    """The copy keeps the capture's aspect, and the card crops it — so a tall
+    capture gives a tall copy rather than being squashed into a card shape."""
+    with run_site({"/": tall_page()}) as site:
+        output = tmp_path / "out"
+        crawl(site, output, 5, viewport=(800, 600), workers=1, full_page=True)
+
+    node = json.loads((output / GRAPH_FILE).read_text())["nodes"][0]
+    copy_of = measure(output / node["thumb"])
+    capture = measure(output / node["screenshot"])
+
+    assert copy_of["width"] == THUMB_WIDTH
+    assert capture["height"] > 3000, "the capture is six screens long"
+    assert copy_of["height"] > 1000, "so the copy is tall too, not squashed"
+    assert copy_of["ink"] > 0
+
+
 def test_a_tall_capture_is_reachable_in_the_inspector(tmp_path: Path) -> None:
     """A capture taller than the box it is shown in would be cropped to a
     sliver by `cover` — which is the thing --full-page was asked for. The
@@ -714,6 +768,84 @@ def test_ui_contact_sheet_and_filter(crawled: Path, graph: dict) -> None:
                 page.fill("#filter", "")
                 page.wait_for_timeout(300)
                 assert page.locator(".tile:visible").count() == len(graph["nodes"])
+            finally:
+                browser.close()
+
+    assert problems == []
+
+
+def test_the_graph_view_draws_the_copies_and_the_inspector_the_capture(
+    crawled: Path, graph: dict
+) -> None:
+    """The whole point of the copies, asserted where it is visible: on what the
+    browser asks for. A card is a thumbnail; the inspector is the page."""
+    with running(crawled) as port:
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch()
+            page = browser.new_page(viewport={"width": 1500, "height": 940})
+            problems = watch(page)
+            try:
+                page.goto(f"http://127.0.0.1:{port}/", wait_until="load")
+                page.wait_for_selector(".node", timeout=15_000)
+                page.wait_for_timeout(2500)
+
+                sources = page.eval_on_selector_all(
+                    ".node img", "els => els.map(e => e.getAttribute('src'))"
+                )
+                assert sources, "no card drew a picture"
+                assert all(s.startswith("thumbs/") for s in sources), sources[:3]
+
+                # The inspector is the one place the capture itself is wanted:
+                # it is showing the page, not a card standing in for one.
+                shot = page.locator("#inspector .insp-shot img").first
+                assert shot.get_attribute("src").startswith("screenshots/")
+            finally:
+                browser.close()
+
+    assert problems == []
+
+
+def test_a_crawl_without_copies_still_opens(tmp_path: Path) -> None:
+    """Every directory written before copies existed names no `thumb`, and the
+    fallback has to be the capture rather than a 404 at a file that was never
+    written — which is what asking for the copy unconditionally would do."""
+    graph = {
+        "root": "000001",
+        "nodes": [
+            {"id": "000001", "url": "http://example.com/", "title": "Home",
+             "depth": 0, "status": 200, "failed": False,
+             "screenshot": "screenshots/000001.webp"},
+            {"id": "000002", "url": "http://example.com/about", "title": "About",
+             "depth": 1, "status": 200, "failed": False,
+             "screenshot": "screenshots/000002.webp"},
+        ],
+        "edges": [{"source": "000001", "target": "000002"}],
+    }
+    (tmp_path / GRAPH_FILE).write_text(json.dumps(graph), encoding="utf-8")
+    (tmp_path / SCREENSHOTS_DIR).mkdir()
+    (tmp_path / PAGES_DIR).mkdir()
+    for node in graph["nodes"]:
+        (tmp_path / node["screenshot"]).write_bytes(TINY_WEBP)
+        (tmp_path / PAGES_DIR / f"{node['id']}.json").write_text(
+            json.dumps(dict(node, links=[], error=None)), encoding="utf-8"
+        )
+
+    with running(tmp_path) as port:
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch()
+            page = browser.new_page(viewport={"width": 1500, "height": 940})
+            problems = watch(page)
+            try:
+                page.goto(f"http://127.0.0.1:{port}/", wait_until="load")
+                page.wait_for_selector(".node", timeout=15_000)
+                page.wait_for_timeout(1500)
+
+                assert page.locator(".node").count() == 2
+                sources = page.eval_on_selector_all(
+                    ".node img", "els => els.map(e => e.getAttribute('src'))"
+                )
+                assert len(sources) == 2
+                assert all(s.startswith("screenshots/") for s in sources)
             finally:
                 browser.close()
 

@@ -47,6 +47,12 @@ class Node:
     (``screenshots/000012.webp``), never absolute, so that a `serve` run rooted
     elsewhere still resolves it. It is ``None`` for a page that failed before it
     could be captured.
+
+    ``thumb`` is the same, for the card-sized copy the graph view draws. It is
+    what the graph and the contact sheet load; the inspector loads the full
+    capture. ``None`` for a page with no picture, and for any crawl made before
+    thumbnails existed — the UI falls back to ``screenshot``, so an older
+    directory still opens and simply pays the old cost.
     """
 
     id: str
@@ -59,6 +65,7 @@ class Node:
     #: ``url`` when the page has no identifier in it, which is most pages; the
     #: payload leaves it out in that case rather than repeating the URL.
     shape: str = ""
+    thumb: str | None = None
     failed: bool = False
     error: str | None = None
     links: list[str] = field(default_factory=list)
@@ -119,6 +126,7 @@ class Graph:
         depth: int = 0,
         status: int | None = None,
         screenshot: str | None = None,
+        thumb: str | None = None,
         failed: bool = False,
         error: str | None = None,
         links: list[str] | None = None,
@@ -141,6 +149,7 @@ class Graph:
             existing.title = title or existing.title
             existing.status = status if status is not None else existing.status
             existing.screenshot = screenshot or existing.screenshot
+            existing.thumb = thumb or existing.thumb
             existing.failed = failed
             existing.error = error
             if links is not None:
@@ -156,6 +165,7 @@ class Graph:
             depth=depth,
             status=status,
             screenshot=screenshot,
+            thumb=thumb,
             # Which route this page is an instance of. Computed once here
             # rather than re-derived by each reader: a second implementation of
             # the rule is exactly what `urls.py` exists to prevent.
@@ -195,6 +205,11 @@ class Graph:
         so a site with no identifiers in its URLs produces exactly the payload
         it produced before shapes existed. The graph view reads an absent
         ``shape`` as "this URL is its own shape".
+
+        ``thumb`` follows the same rule for the same reason: it is written only
+        when there is one, so a crawl whose pages have no card-sized copy
+        produces exactly the payload it produced before thumbnails existed, and
+        the graph view reads an absent ``thumb`` as "use the screenshot".
         """
         return {
             "root": self.root_id,
@@ -208,6 +223,7 @@ class Graph:
                     "failed": node.failed,
                     "screenshot": node.screenshot,
                     **({"shape": node.shape} if node.shape != node.url else {}),
+                    **({"thumb": node.thumb} if node.thumb else {}),
                 }
                 for node in self._nodes
             ],

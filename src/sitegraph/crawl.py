@@ -16,6 +16,7 @@ Everything is written as it is discovered, so a crawl stopped by Ctrl-C or by
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import shutil
@@ -82,6 +83,12 @@ MAX_VIEWPORT = 10_000
 #: of the PNG equivalent. Spec §7 prefers WebP to keep the dataset small.
 SCREENSHOT_QUALITY = 80
 
+#: The width of the card-sized copy the graph view draws. Twice the width of a
+#: node card (168), so a capture stays sharp through a couple of steps of zoom,
+#: and still around a fiftieth of the pixels of a 1440x900 capture.
+THUMB_WIDTH = 336
+THUMB_QUALITY = 80
+
 #: How long to let a loaded page keep mutating before reading it. Long enough
 #: for a client-rendered shell to paint, short enough that a page polling the
 #: network forever (which never reaches "networkidle") costs seconds, not
@@ -125,6 +132,35 @@ els => els
 """
 
 
+#: Downscale a capture into the card-sized copy the graph view draws.
+#:
+#: Chromium is the only image encoder this project has — there is no imaging
+#: library in the dependency list — and one is already open, so the copy is
+#: made by drawing the capture into a canvas at the target width. It runs in a
+#: scratch page rather than in the page just visited: a site's own CSP can
+#: forbid a `data:` image, and its scripts have no business executing while we
+#: do this.
+#:
+#: Scaled by width with the aspect kept, so a full-page capture stays as tall
+#: as it is: a card crops to the top left either way.
+_THUMBNAIL_JS = """
+async ([base64, width, quality]) => {
+  const image = new Image();
+  image.src = "data:image/webp;base64," + base64;
+  await image.decode();
+  const height = Math.max(
+    1, Math.round((image.naturalHeight * width) / image.naturalWidth)
+  );
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  canvas.getContext('2d').drawImage(image, 0, 0, width, height);
+  // "data:," if the encoder refuses, which splits to the empty string.
+  return canvas.toDataURL('image/webp', quality).split(',')[1] || null;
+}
+"""
+
+
 @dataclass(slots=True)
 class PageResult:
     """What one visit to one URL produced.
@@ -144,6 +180,12 @@ class PageResult:
     #: only as tall as the window and a full-page capture cannot reach past the
     #: fold. False whenever that could not be asked (see `_OVERFLOWS_JS`).
     scrolls_inside: bool = False
+    #: A card-sized copy of the capture, as WebP bytes, for the graph view to
+    #: draw node cards from. Carried in memory rather than through a second
+    #: scratch file because it is a couple of kilobytes and the worker already
+    #: has it. ``None`` whenever there is no capture to copy, and whenever the
+    #: copy could not be made — the graph view then falls back to the capture.
+    thumbnail: bytes | None = None
 
 
 class Renderer(Protocol):
@@ -296,6 +338,7 @@ class ChromiumRenderer:
         self._playwright = None
         self._browser = None
         self._context = None
+        self._thumb_page = None
 
     def __enter__(self) -> Self:
         self._playwright = sync_playwright().start()
@@ -328,6 +371,7 @@ class ChromiumRenderer:
         # already died (itself a crawl failure) an exception here would replace
         # the real error with a teardown error.
         for closer, method in (
+            (self._thumb_page, "close"),
             (self._context, "close"),
             (self._browser, "close"),
             (self._playwright, "stop"),
@@ -338,6 +382,29 @@ class ChromiumRenderer:
                 except Exception:  # noqa: BLE001 - teardown must not mask the cause
                     pass
         self._context = self._browser = self._playwright = None
+        self._thumb_page = None
+
+    def _thumbnail(self, capture: Path) -> bytes | None:
+        """A card-sized copy of the capture just written, or ``None``.
+
+        Best-effort on purpose. By this point the page is described and
+        captured, so a copy that could not be made should cost the graph view
+        its shortcut and nothing else: the view falls back to the capture
+        itself, which is exactly what a crawl made before copies existed gives
+        it anyway.
+        """
+        if self._context is None:
+            return None
+        try:
+            if self._thumb_page is None:
+                self._thumb_page = self._context.new_page()
+            encoded = base64.b64encode(capture.read_bytes()).decode("ascii")
+            scaled = self._thumb_page.evaluate(
+                _THUMBNAIL_JS, [encoded, THUMB_WIDTH, THUMB_QUALITY]
+            )
+        except (PlaywrightError, OSError):
+            return None
+        return base64.b64decode(scaled) if scaled else None
 
     def _adopt_session(self) -> None:
         """Take the cookies any other worker has seen since this one looked."""
@@ -419,6 +486,7 @@ class ChromiumRenderer:
                 status=status,
                 title=title,
                 hrefs=hrefs,
+                thumbnail=self._thumbnail(screenshot_path) if captured else None,
                 # Only a complaint about a picture that exists: with no
                 # capture at all, "this one stops at the fold" would describe
                 # the wrong problem.
@@ -1169,8 +1237,14 @@ def _commit(
     # from `failed` rather than a broken image. A page that rendered but whose
     # capture never landed gets `None` too, which is honest about the same way.
     screenshot = None
+    thumb = None
     if publish and not result.failed and store.adopt_screenshot(job.scratch, node.id):
         screenshot = store.screenshot_rel(node.id)
+        # Only ever alongside a capture: a copy of a picture that does not
+        # exist would be a graph entry pointing at nothing.
+        if result.thumbnail:
+            store.write_thumbnail(node.id, result.thumbnail)
+            thumb = store.thumbnail_rel(node.id)
 
     graph.add_page(
         job.url,
@@ -1178,6 +1252,7 @@ def _commit(
         depth=job.depth,
         status=result.status,
         screenshot=screenshot,
+        thumb=thumb,
         failed=result.failed,
         error=result.error,
         links=links,

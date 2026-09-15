@@ -90,6 +90,25 @@ def test_every_graph_node_is_reachable(crawl_dir: Path) -> None:
             assert request(port, f"/pages/{node['id']}.json")[0] == 200
             if node["screenshot"]:
                 assert request(port, f"/{node['screenshot']}")[0] == 200
+            # Named only when it exists: a crawl made before thumbnails has no
+            # key here, and the UI reads that as "use the screenshot".
+            if node.get("thumb"):
+                assert request(port, f"/{node['thumb']}")[0] == 200
+
+
+def test_serves_thumbnails(crawl_dir: Path) -> None:
+    with running(crawl_dir) as port:
+        status, content_type, body = request(port, "/thumbs/000001.webp")
+
+    assert status == 200
+    assert content_type == "image/webp"
+    assert body[:4] == b"RIFF"
+
+
+def test_a_thumbnail_that_was_never_written_is_not_found(crawl_dir: Path) -> None:
+    """000003 failed to render, so it has no capture and no copy of one."""
+    with running(crawl_dir) as port:
+        assert request(port, "/thumbs/000003.webp")[0] == 404
 
 
 def test_responses_are_not_cached(crawl_dir: Path) -> None:
@@ -153,6 +172,7 @@ def test_unsupported_method_is_rejected(crawl_dir: Path) -> None:
         "/pages/../../secret.txt",
         "/pages/%2e%2e%2f%2e%2e%2fsecret.txt",
         "/screenshots/..%2f..%2fsecret.txt",
+        "/thumbs/..%2f..%2fsecret.txt",
         "/screenshots/../../../etc/passwd",
         "/%2e%2e/%2e%2e/etc/passwd",
         "/pages/..%5c..%5csecret.txt",
@@ -250,6 +270,7 @@ def test_serving_never_writes_to_the_crawl_directory(crawl_dir: Path) -> None:
             "/graph.json",
             "/pages/000001.json",
             "/screenshots/000001.webp",
+            "/thumbs/000001.webp",
             "/nope",
         ):
             request(port, path)

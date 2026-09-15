@@ -89,6 +89,61 @@ trapped pages are one fact rather than a hundred lines. Asked only when
 `--full-page` was asked for, and only reported for a capture that actually
 happened.
 
+## The card-sized copies
+
+Every captured page leaves two pictures in the crawl directory:
+
+```
+.sitegraph/
+├── screenshots/000001.webp   # the capture, at --viewport
+└── thumbs/000001.webp        # 336px wide, for the graph view
+```
+
+The graph and the contact sheet draw from `thumbs/`; the inspector draws from
+`screenshots/`. An `<img>` decodes at its *intrinsic* size whatever it is
+painted at, so pointing a few hundred node cards at full captures made the
+browser decode a few hundred 1440x900 images to paint each one the size of a
+full stop — and the interface stalled in bursts while it did. Measured on 500
+distinct routes, with every card crossing the viewport:
+
+| capture           | loaded  | worst frame | main thread blocked |
+| ----------------- | ------- | ----------- | ------------------- |
+| 1440x900          | 12.4 MB | 309 ms      | 952 ms              |
+| 1440x3790 (`--full-page`) | 49.7 MB | **2167 ms** | **8426 ms** |
+| 336x210 copy      | 0.5 MB  | 58 ms       | **0 ms**            |
+
+`--full-page` is the case that hurts, which is the one to check a change
+against. 336px is twice the 168px card, so a card stays sharp through a couple
+of steps of zoom; 32px was measured too and is no faster, so the extra pixels
+cost nothing. A copy is roughly a tenth the bytes of its capture and adds no
+measurable crawl time — 61 pages took 12.6s without copies and 12.5s with them.
+
+**Chromium makes the copy**, because it is the only image encoder this project
+has: there is no imaging library in the dependency list. The worker that took
+the capture hands it to a scratch page as a `data:` URL, draws it into a canvas
+at `THUMB_WIDTH`, and reads the result back as WebP. A scratch page rather than
+the page just visited, because a site's own CSP can forbid a `data:` image and
+its scripts have no business running while we do this. Overriding the device
+scale factor through CDP would be cheaper still and does not work — it left the
+capture byte-identical at 1440x900.
+
+Three properties worth keeping:
+
+- **`thumb` is emitted only when there is one**, like `shape`. A directory
+  written before copies existed produces exactly the payload it produced then,
+  and the UI reads an absent `thumb` as "draw the capture" — slower, still
+  correct. Asking for the copy unconditionally would 404 at a file that was
+  never written, which the browser tests catch as a failed request.
+- **A copy only ever accompanies a capture.** A page that failed to render has
+  neither, because a copy of a picture that does not exist would be a graph
+  entry pointing at nothing.
+- **The copies live in `thumbs/`, not beside the screenshots**, so that
+  `screenshots/` stays exactly one file per rendered page — a property the
+  tests and `--resume` both count on.
+
+`--resume` does not backfill: pages captured before copies existed keep their
+capture and draw from it. Re-crawl, or leave them; both work.
+
 ## Looking before writing
 
 ```bash
