@@ -144,6 +144,64 @@ Three properties worth keeping:
 `--resume` does not backfill: pages captured before copies existed keep their
 capture and draw from it. Re-crawl, or leave them; both work.
 
+## What the graph view draws, and what it declines to
+
+A crawl of a few thousand routes cannot be drawn as a grid of cards. At the zoom
+that frames the whole graph, a 168px card is a dozen pixels across, so a screen
+full of them is a smear; and painting every picture, every title and every
+link at that size is the most expensive thing the view can be asked to do.
+Measured on a crawl of 4000 routes and 76,121 links, with `--full-page` copies:
+
+| | before | after |
+| --- | --- | --- |
+| pan, 95th-percentile frame | 533 ms (max 3425 ms) | **9 ms** |
+| long tasks during a ~4 s pan | 74, totalling 63 s | **0** |
+| time blocked in the layout pass | 41 s | **8 s** |
+| thumbnail pixels decoded | 6.8 GB | **none** |
+
+Two rules do nearly all of that, and both are in `app.js`:
+
+- **A card too small to be a card is drawn as a mark.** `syncView` sets
+  `data-lod` from the card's on-screen width; under `FULL_CARD_PX` (64, about
+  where a thumbnail stops being a picture of a page) the card is a flat
+  rectangle — no picture, no text, no shadow. The card's *box* never changes,
+  which is what lets the culler, the edge trim, `fit`'s padding and the layout's
+  separation all measure one card instead of four that drift.
+- **Only what is on screen is drawn.** Cards outside the viewport are `hidden`.
+  Edges are drawn only at `full` lod — an arrow says something only when you can
+  see both ends — and only where both endpoints are drawn.
+
+**The `<img>` is always in the DOM and always carries its `src`**, at every lod;
+only `display` changes. That keeps the DOM a stable contract for the tests, and
+it is what makes the decode go away: a `loading="lazy"` image inside a
+`display: none` box is never fetched, and one that is never painted is never
+decoded. Measured, not assumed — it is the single assumption the 6.8 GB figure
+rests on.
+
+Three consequences worth knowing:
+
+- **`line.edge` counts the edges being drawn, not the edges in the graph.** At
+  the fitted zoom of a small site those are the same number, and the tests that
+  assert an exact count run against a crawl of eleven routes. At the fitted zoom
+  of a crowded one, it is zero, on purpose.
+- **The card's height is a number the CSS and the JS share.** `--card-h` and
+  `CARD_H` must agree — the edge trim stops at half of it — and a card drawn
+  taller than that gets arrows that stop in mid air.
+- **The layout's density comes from the separation pass, not the physics.**
+  `tick`'s repulsion has no rest density: gravity pulls everything inward and
+  the repulsion is deliberately scaled down as the graph grows (see
+  `REPULSION_NODE_SCALE`), so the force equilibrium at a few hundred routes is a
+  clump. `separate` is what stops cards overlapping, and it runs to convergence
+  after the forces rather than as one force among several. It is axis-aligned
+  and grid-bucketed — O(n) where the repulsion is O(n²) — and it packs about
+  4100 cards into the 12000-unit world before it has to start shrinking the
+  footprint. Past that, overlap comes back gradually rather than every card
+  being wedged against the world's edge.
+
+The physics is still O(n²) — 3 ms a step at a thousand routes, 36 ms at four
+thousand — so both the relaxation and the packing are bounded by a clock rather
+than a step count. A spatial index for the repulsion is the way to raise that.
+
 ## Looking before writing
 
 ```bash
@@ -288,7 +346,9 @@ For a capture of the whole page rather than the fold, see `--full-page` above.
 Node cards use
 `object-fit: cover` with `object-position: top left`, so a portrait capture is
 cropped to the top of the page — a header-shaped thumbnail — rather than
-squashed. Verified by crawling the fixture at 390x844 and 1920x1080.
+squashed. Verified by crawling the fixture at 390x844 and 1920x1080. This is
+about a card drawn *as* a card; below the zoom where that happens the card is a
+mark and has no picture to crop (see "What the graph view draws" above).
 
 ## Concurrency
 

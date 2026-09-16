@@ -933,6 +933,217 @@ def test_ui_pan_and_zoom(crawled: Path) -> None:
                 browser.close()
 
 
+# --- a crowded graph ---------------------------------------------------
+#
+# A crawl of a few hundred routes cannot be drawn as cards: at the zoom that
+# frames the whole graph a card is a few dozen pixels across, and painting the
+# pictures, the titles and the links at that size is both unreadable and the
+# most expensive thing the view can do. The rule is that a card narrower than
+# 64 screen pixels is drawn as a flat mark instead, and only the cards on
+# screen are drawn at all.
+#
+# Written by hand rather than crawled, like the no-copies test above: what is
+# under test is the drawing rule, and a few hundred real pages would cost
+# minutes of Chromium to arrive at the same picture.
+
+CROWDED_ROUTES = 300
+CROWDED_FAILED = "000007"
+
+
+def write_crowded_crawl(directory: Path) -> dict:
+    """A few hundred routes, one of which failed to render."""
+    nodes = []
+    for index in range(CROWDED_ROUTES):
+        node_id = f"{index + 1:06d}"
+        failed = node_id == CROWDED_FAILED
+        nodes.append(
+            {
+                "id": node_id,
+                "url": f"http://example.com/page-{index}",
+                "title": f"Page {index}",
+                "depth": index % 6,
+                "status": None if failed else 200,
+                "failed": failed,
+                "screenshot": None if failed else f"screenshots/{node_id}.webp",
+                "thumb": None if failed else f"thumbs/{node_id}.webp",
+            }
+        )
+    edges = [
+        {"source": f"{index + 1:06d}", "target": f"{min(index + 2, CROWDED_ROUTES):06d}"}
+        for index in range(CROWDED_ROUTES - 1)
+    ]
+    graph = {"root": "000001", "nodes": nodes, "edges": edges}
+
+    (directory / PAGES_DIR).mkdir(parents=True)
+    (directory / SCREENSHOTS_DIR).mkdir()
+    (directory / THUMBS_DIR).mkdir()
+    (directory / GRAPH_FILE).write_text(json.dumps(graph), encoding="utf-8")
+    for node in nodes:
+        (directory / PAGES_DIR / f"{node['id']}.json").write_text(
+            json.dumps(dict(node, links=[], error=None)), encoding="utf-8"
+        )
+        if not node["failed"]:
+            (directory / SCREENSHOTS_DIR / f"{node['id']}.webp").write_bytes(TINY_WEBP)
+            (directory / THUMBS_DIR / f"{node['id']}.webp").write_bytes(TINY_WEBP)
+    return graph
+
+
+def test_a_crowded_graph_draws_marks_until_you_zoom_in(tmp_path: Path) -> None:
+    write_crowded_crawl(tmp_path)
+
+    with running(tmp_path) as port:
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch()
+            page = browser.new_page(viewport={"width": 1500, "height": 940})
+            # Only the card-sized copies: the inspector opens the selected
+            # page's capture at load, which is a picture of one page and not a
+            # card standing in for one.
+            pictures: list[str] = []
+            page.on(
+                "request",
+                lambda r: pictures.append(r.url) if "/thumbs/" in r.url else None,
+            )
+            problems = watch(page)
+            try:
+                page.goto(f"http://127.0.0.1:{port}/", wait_until="load")
+                page.wait_for_selector(".node", timeout=15_000)
+                page.wait_for_function(
+                    "() => !state.settling && state.drawn.size > 0", timeout=30_000
+                )
+                page.wait_for_timeout(600)
+
+                # Every route still has a card element — folding and culling are
+                # not a way of losing pages.
+                assert page.locator(".node").count() == CROWDED_ROUTES
+
+                # ...but at the fitted zoom none of them is painted as a card,
+                # and not one picture is fetched to draw them with.
+                assert page.locator('.node[data-lod="mark"]').count() == CROWDED_ROUTES
+                assert page.locator(".node img:visible").count() == 0
+                assert pictures == [], pictures[:3]
+
+                # A link is only drawn where you can see both of its ends.
+                assert page.locator("line.edge").count() == 0
+
+                # Zoom in far enough for a card to be a card.
+                page.evaluate("""() => {
+                    const view = viewportSize();
+                    const point = state.pos.get(state.nodes[0].id);
+                    state.transform = { k: 0.6, x: view.width / 2 - point.x * 0.6,
+                                        y: view.height / 2 - point.y * 0.6 };
+                    applyTransform();
+                }""")
+                page.wait_for_timeout(600)
+
+                full = page.locator('.node[data-lod="full"]')
+                assert full.count() > 0, "zooming in should draw cards"
+                assert page.locator(".node img:visible").count() > 0
+                assert pictures, "the cards that are drawn should fetch their copies"
+                assert page.locator("line.edge").count() > 0
+            finally:
+                browser.close()
+
+    assert problems == []
+
+
+def test_only_the_cards_on_screen_are_drawn(tmp_path: Path) -> None:
+    write_crowded_crawl(tmp_path)
+
+    with running(tmp_path) as port:
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch()
+            page = browser.new_page(viewport={"width": 1500, "height": 940})
+            problems = watch(page)
+            try:
+                page.goto(f"http://127.0.0.1:{port}/", wait_until="load")
+                page.wait_for_selector(".node", timeout=15_000)
+                page.wait_for_function(
+                    "() => !state.settling && state.drawn.size > 0", timeout=30_000
+                )
+                page.wait_for_timeout(600)
+
+                def drawn() -> int:
+                    return page.evaluate(
+                        "() => [...state.nodeEls.values()].filter((c) => !c.hidden).length"
+                    )
+
+                # Zoomed in, the stage holds a fraction of the graph; the rest
+                # is in the document but not drawn.
+                page.evaluate("""() => {
+                    const view = viewportSize();
+                    const point = state.pos.get(state.nodes[0].id);
+                    state.transform = { k: 1, x: view.width / 2 - point.x,
+                                        y: view.height / 2 - point.y };
+                    applyTransform();
+                }""")
+                page.wait_for_timeout(400)
+                on_screen = drawn()
+                assert 0 < on_screen < CROWDED_ROUTES
+                assert page.locator(".node:visible").count() == on_screen
+
+                # Panning to the far edge of the world brings others in.
+                page.evaluate("""() => {
+                    const last = state.pos.get(state.nodes[state.nodes.length - 1].id);
+                    const view = viewportSize();
+                    state.transform = { k: 1, x: view.width / 2 - last.x,
+                                        y: view.height / 2 - last.y };
+                    applyTransform();
+                }""")
+                page.wait_for_timeout(400)
+                assert drawn() > 0
+                assert page.locator('.node:visible[data-id="000300"]').count() == 1
+
+                # The selected card is drawn wherever it is, so a page chosen
+                # from the instance list or the inspector is never invisible.
+                page.evaluate("() => select('000001', { center: false })")
+                page.wait_for_timeout(300)
+                assert page.locator('.node:visible[data-id="000001"]').count() == 1
+            finally:
+                browser.close()
+
+    assert problems == []
+
+
+def test_a_failed_page_stays_recognisable_at_every_zoom(tmp_path: Path) -> None:
+    """A page that could not be rendered keeps its place in the graph — spec
+    §7 — and has to keep it at the zoom where the cards are only marks."""
+    write_crowded_crawl(tmp_path)
+
+    with running(tmp_path) as port:
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch()
+            page = browser.new_page(viewport={"width": 1500, "height": 940})
+            try:
+                page.goto(f"http://127.0.0.1:{port}/", wait_until="load")
+                page.wait_for_selector(".node", timeout=15_000)
+                page.wait_for_function(
+                    "() => !state.settling && state.drawn.size > 0", timeout=30_000
+                )
+                page.wait_for_timeout(600)
+
+                failed = page.locator(f'.node[data-id="{CROWDED_FAILED}"]')
+                assert failed.count() == 1
+                assert failed.get_attribute("data-lod") == "mark"
+
+                # At this size a badge is unreadable and a 1px border is a
+                # tenth of a pixel, so failure is carried by the fill.
+                colours = page.evaluate("""() => {
+                    const of = (id) => getComputedStyle(
+                        document.querySelector('.node[data-id="' + id + '"]')
+                    ).backgroundColor;
+                    return [of('000001'), of('000007')];
+                }""")
+                assert colours[0] != colours[1], colours
+
+                # A failed page has no picture, so it never fetched one.
+                assert (
+                    page.locator(f'.node[data-id="{CROWDED_FAILED}"] .shot-missing').count()
+                    == 1
+                )
+            finally:
+                browser.close()
+
+
 @pytest.mark.parametrize(
     ("contents", "expected"),
     [

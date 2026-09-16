@@ -15,9 +15,24 @@
 const WORLD = 12000;
 const ORIGIN = WORLD / 2;
 const CARD_W = 168;
-const CARD_H = 138;
+/* The height `.node` is given by `--card-h`. The two must agree: this is what
+   the edge trim stops short of and what the separation pass keeps apart, and a
+   card that is drawn taller than the number here gets edges that stop in mid
+   air. `.thumb` (105) + `.meta` (46) + two 1px borders. */
+const CARD_H = 153;
 const MIN_K = 0.04;
 const MAX_K = 3;
+
+/* A card narrower than this on screen is drawn as a mark rather than a card:
+   no picture, no text, no shadow. Below roughly this size a thumbnail stops
+   being a picture of a page and starts being noise, and 11px type is being
+   painted at five. It is deliberately well under the zoom a small graph
+   settles at — an eleven-route crawl fits at about 108px a card — so a small
+   site looks exactly as it always did. */
+const FULL_CARD_PX = 64;
+
+/* The space kept between two neighbouring cards by the separation pass. */
+const CARD_GAP = 12;
 
 const REPULSION = 900000;
 const SPRING = 0.02;
@@ -31,10 +46,38 @@ const DAMPING = 0.82;
    Dividing by the count keeps the radius roughly constant instead. */
 const REPULSION_NODE_SCALE = 40;
 
+/* How long one frame of the layout pass may spend on arithmetic before it
+   hands the thread back to paint. A frame budget rather than a fixed number of
+   steps, so it holds on a slow machine and at any graph size. */
+const FRAME_MS = 12;
+
+/* How long the whole relaxation may take. A step is O(n²) — measured at 3ms
+   for a thousand nodes and 36ms for four thousand — so the number of steps a
+   graph can afford falls away as it grows, and the clock is the only honest
+   bound on the pass. Past this the layout is simply left as rough as it got:
+   it is a cosmetic pass over the spiral seed, not a load-bearing one. A
+   spatial index for the repulsion is the way to raise this properly. */
+const SETTLE_BUDGET_MS = 1500;
+
+/* How long the packing pass may take. It converges in a few hundred rounds at
+   a thousand nodes and cannot finish at all on a graph too big for its
+   footprint, so it stops on the clock as well as on the count. */
+const SEPARATION_BUDGET_MS = 400;
+
 /* The simulation runs inside the fixed #world box, and the finished layout is
    rescaled to fit it. Without a hard bound, one runaway node stretches the
    bounding box that `fit` frames, which is how you get a blank graph view. */
 const LAYOUT_MARGIN = CARD_W;
+
+/* How many times the overlap pass may be re-run on the finished layout. */
+const SEPARATION_PASSES = 300;
+
+/* How far into each other two cards may sit before the layout is considered
+   unfinished. A packed layout is made of grazing contacts, and chasing the
+   last of them costs far more than it shows: at a thousand cards the
+   difference between 300 rounds and 2000 is 1.4 seconds and three pairs that
+   overlap by a quarter of a card. Anything shallower than this is left alone. */
+const OVERLAP_TOLERANCE = 0.25;
 
 const state = {
   nodes: [], // the drawn nodes: one per route, see foldByShape
@@ -44,13 +87,21 @@ const state = {
   repOf: new Map(), // id -> the id of the route it belongs to
   instances: new Map(), // representative id -> every member node
   edges: [],
-  edgeEls: [],
   nodeEls: new Map(),
-  selected: null,
+  edgePool: [], // <line> elements, grown to the widest view seen so far
+  edgeRefs: [], // the edge each pool slot currently holds, for the used prefix
+  edgeUsed: 0, // how much of the pool is in use
+  drawn: new Map(), // id -> the {hidden, lod} last applied to that card
+  selected: null, // the page asked for; may be a folded instance
+  highlightId: null, // the *route* it resolves to — what the edges light up
+  dragging: null, // the card under the pointer, which must never be culled
+  settling: false, // the layout is still moving; see syncView
   filter: "",
   transform: { x: 0, y: 0, k: 1 },
+  viewport: { width: 0, height: 0 }, // kept by a ResizeObserver, never measured
   pos: new Map(), // id -> {x, y, vx, vy, pinned}
   pages: new Map(), // id -> page record (fetched lazily)
+  sheetBuilt: false, // the contact sheet renders on first open, not at load
 };
 
 /* ------------------------------------------------------------------ utils */
@@ -222,9 +273,12 @@ async function init() {
     return;
   }
 
+  // Set before the first paint, not inside `settle`: `fit` runs on the seed
+  // layout and would otherwise paint one frame at the seed's zoom, which is
+  // enough for the browser to start fetching every thumbnail it can see.
+  state.settling = true;
   buildLayout();
   renderGraph();
-  renderSheet();
 
   const rootNode = root || state.nodes[0];
   state.nodeEls.get(rootNode.id)?.classList.add("root");
@@ -314,8 +368,114 @@ function buildLayout() {
   });
 }
 
-/** One force step: pairwise repulsion, edge springs, gravity to the centre. */
-function tick(points, springs, repulsion) {
+/** The footprint the separation pass must keep clear, shrunk when the world
+ * cannot hold that many cards.
+ *
+ * A card plus its gap is 180 by 165 units, so the world holds about 4100 of
+ * them before anything has to overlap. Past that the footprint shrinks and
+ * cards overlap gradually, which is better than every card being wedged
+ * against the world's edge by a constraint that cannot be satisfied.
+ */
+function footprintFor(count) {
+  const usable = (WORLD - 2 * LAYOUT_MARGIN) ** 2;
+  const wanted = count * (CARD_W + CARD_GAP) * (CARD_H + CARD_GAP);
+  const scale = Math.min(1, Math.sqrt((usable * 0.9) / wanted));
+  return { width: CARD_W * scale, height: CARD_H * scale };
+}
+
+/** Push apart any two cards whose boxes touch.
+ *
+ * Axis-aligned rather than radial, because that is the shape a card actually
+ * is: two of them are clear of each other as soon as they differ by a card's
+ * width in x *or* a card's height in y. A radial separation would have to
+ * clear hypot(168, 153) = 227 in every direction, which caps the world at
+ * about 2600 cards instead of 4100.
+ *
+ * Bucketed by cell, so each card is only compared against the nine cells
+ * around it. That makes this O(n) where the repulsion in `tick` is O(n²), and
+ * is what lets it run on every step. Cards are visited in index order and
+ * pairs taken once, so the pass is deterministic — the layout has to be the
+ * same shape on every reload.
+ *
+ * A pinned card is moved by nobody: a card the user placed stays put.
+ *
+ * Returns how many pairs are still overlapping by more than `OVERLAP_TOLERANCE`
+ * — zero means the layout is as unpacked as it needs to be.
+ */
+function separate(points, footprint) {
+  const width = footprint.width + CARD_GAP;
+  const height = footprint.height + CARD_GAP;
+  let overlaps = 0;
+
+  const cells = new Map();
+  for (let i = 0; i < points.length; i++) {
+    const point = points[i];
+    const key =
+      Math.floor(point.x / width) + "," + Math.floor(point.y / height);
+    const bucket = cells.get(key);
+    if (bucket) bucket.push(i);
+    else cells.set(key, [i]);
+  }
+
+  for (let i = 0; i < points.length; i++) {
+    const a = points[i];
+    const cx = Math.floor(a.x / width);
+    const cy = Math.floor(a.y / height);
+    for (let ox = -1; ox <= 1; ox++) {
+      for (let oy = -1; oy <= 1; oy++) {
+        const bucket = cells.get(cx + ox + "," + (cy + oy));
+        if (!bucket) continue;
+        for (const j of bucket) {
+          if (j <= i) continue; // once per pair, in index order
+          const b = points[j];
+          if (a.pinned && b.pinned) continue;
+
+          const dx = b.x - a.x;
+          const dy = b.y - a.y;
+          const overlapX = width - Math.abs(dx);
+          const overlapY = height - Math.abs(dy);
+          if (overlapX <= 0 || overlapY <= 0) continue; // already clear
+          // Counted only past the tolerance, which is what the caller is
+          // waiting for; the push below still takes every overlap apart.
+          if (Math.max(overlapX / width, overlapY / height) > OVERLAP_TOLERANCE) {
+            overlaps++;
+          }
+
+          // Out along the axis they overlap least: the shortest way clear, and
+          // it moves the neighbourhood around the least.
+          const horizontal = overlapX < overlapY;
+          const step = (horizontal ? overlapX : overlapY) * 0.5;
+          const sign = (horizontal ? dx : dy) < 0 ? 1 : -1;
+          const sx = horizontal ? step * sign : 0;
+          const sy = horizontal ? 0 : step * sign;
+
+          // A pinned partner takes none of it, so the free card takes both
+          // halves and the pair still ends up clear in one step.
+          const free = a.pinned || b.pinned ? 2 : 1;
+          if (!a.pinned) {
+            a.x += sx * free;
+            a.y += sy * free;
+          }
+          if (!b.pinned) {
+            b.x -= sx * free;
+            b.y -= sy * free;
+          }
+        }
+      }
+    }
+  }
+
+  for (const point of points) {
+    point.x = clamp(point.x, LAYOUT_MARGIN, WORLD - LAYOUT_MARGIN);
+    point.y = clamp(point.y, LAYOUT_MARGIN, WORLD - LAYOUT_MARGIN);
+  }
+
+  return overlaps;
+}
+
+/** One force step: pairwise repulsion, edge springs, gravity to the centre,
+ * then the separation that keeps the cards off each other. */
+function tick(points, springs, repulsion, footprint) {
   const count = points.length;
 
   for (let i = 0; i < count; i++) {
@@ -369,6 +529,10 @@ function tick(points, springs, repulsion) {
     point.x = clamp(point.x + point.vx, LAYOUT_MARGIN, WORLD - LAYOUT_MARGIN);
     point.y = clamp(point.y + point.vy, LAYOUT_MARGIN, WORLD - LAYOUT_MARGIN);
   }
+
+  // After the clamp, not before: the clamp is a hard bound, and a separation
+  // pass that ran first would have its pushes partly undone.
+  separate(points, footprint);
 }
 
 /** Relax the layout, in frames, so the page stays responsive while it runs. */
@@ -386,22 +550,50 @@ async function settle() {
     if (source !== undefined && target !== undefined) springs.push(source, target);
   }
 
-  // O(n^2) per step, so the budget shrinks as the graph grows; the pass is
-  // cosmetic after the spiral seed, not load-bearing.
+  // O(n^2) per step, so a large graph buys fewer steps and a bounded frame
+  // rather than a fixed count: 120 steps of a 4000-node graph is a minute of
+  // arithmetic spent blocking the tab. The pass is cosmetic after the spiral
+  // seed, not load-bearing, so a rougher layout at scale is a fair trade.
   const count = points.length;
   const repulsion = REPULSION / (1 + count / REPULSION_NODE_SCALE);
-  const steps = count <= 60 ? 320 : count <= 200 ? 200 : 120;
-  const perFrame = count <= 120 ? 8 : 4;
+  const footprint = footprintFor(count);
+  const steps = count <= 60 ? 320 : count <= 200 ? 180 : count <= 800 ? 120 : 60;
+  const started = performance.now();
 
-  for (let done = 0; done < steps; done += perFrame) {
-    for (let n = 0; n < perFrame && done + n < steps; n++) {
-      tick(points, springs, repulsion);
-    }
+  for (let done = 0; done < steps; ) {
+    const until = performance.now() + FRAME_MS;
+    do {
+      tick(points, springs, repulsion, footprint);
+      done++;
+    } while (done < steps && performance.now() < until);
     paintPositions();
     await new Promise((resolve) => requestAnimationFrame(resolve));
+    if (performance.now() - started > SETTLE_BUDGET_MS) break;
   }
 
-  fitToWorld(points);
+  // Rescaling the layout to fit the world scales the separation away with it,
+  // so the gap is re-established in the coordinates that actually get drawn.
+  //
+  // This runs to convergence rather than for a fixed number of rounds, and it
+  // is the only thing that sets the graph's density. The force model above has
+  // no rest density at all: gravity pulls everything inward and the repulsion
+  // is deliberately scaled down as the graph grows, so the equilibrium at a
+  // few hundred routes is a clump of cards drawn on top of each other in the
+  // middle. Here there is no competing pull, so every round can only reduce
+  // the overlap — the packing expands until it fits, and the result is a graph
+  // that fills the world instead of piling up in it.
+  const shrink = fitToWorld(points);
+  const fitted = {
+    width: footprint.width * shrink,
+    height: footprint.height * shrink,
+  };
+  const packing = performance.now();
+  for (let pass = 0; pass < SEPARATION_PASSES; pass++) {
+    if (separate(points, fitted) === 0) break;
+    if (performance.now() - packing > SEPARATION_BUDGET_MS) break;
+  }
+
+  state.settling = false;
   paintPositions();
 }
 
@@ -412,6 +604,9 @@ async function settle() {
  * Rescaling preserves the shape the simulation produced and guarantees that
  * `fit` has something reasonable to frame. A layout that already fits is left
  * alone, so small graphs keep the spacing the forces chose.
+ *
+ * Returns the factor it applied, so the caller can shrink the separation
+ * footprint by the same amount and put the gaps back.
  */
 function fitToWorld(points) {
   let minX = Infinity;
@@ -424,11 +619,11 @@ function fitToWorld(points) {
     maxX = Math.max(maxX, point.x);
     maxY = Math.max(maxY, point.y);
   }
-  if (!Number.isFinite(minX)) return;
+  if (!Number.isFinite(minX)) return 1;
 
   const span = Math.max(maxX - minX, maxY - minY);
   const target = WORLD - 2 * LAYOUT_MARGIN;
-  if (span <= target || span === 0) return;
+  if (span <= target || span === 0) return 1;
 
   const scale = target / span;
   const cx = (minX + maxX) / 2;
@@ -437,6 +632,7 @@ function fitToWorld(points) {
     point.x = ORIGIN + (point.x - cx) * scale;
     point.y = ORIGIN + (point.y - cy) * scale;
   }
+  return scale;
 }
 
 /* -------------------------------------------------------------- rendering */
@@ -446,7 +642,10 @@ function renderGraph() {
   const nodeLayer = $("nodes");
   edgeLayer.replaceChildren();
   nodeLayer.replaceChildren();
-  state.edgeEls = [];
+  state.edgePool = [];
+  state.edgeRefs = [];
+  state.edgeUsed = 0;
+  state.drawn = new Map();
   state.nodeEls = new Map();
 
   // Arrowheads are markers, so their colour comes from here rather than CSS —
@@ -463,13 +662,10 @@ function renderGraph() {
     )
   );
 
-  for (const edge of state.edges) {
-    const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
-    line.setAttribute("class", "edge");
-    line.setAttribute("marker-end", "url(#arrow)");
-    edgeLayer.append(line);
-    state.edgeEls.push(Object.assign({ el: line }, edge));
-  }
+  // No edges here: they are created on demand by `paintEdges` for the ones
+  // actually on screen. Writing out every edge up front is what made a
+  // 76,000-link crawl cost a second of start-up and put 76,000 elements on the
+  // layer the compositor re-rasters on every pan.
 
   for (const node of state.nodes) {
     const card = el(
@@ -530,20 +726,175 @@ function marker(id, color) {
   return node;
 }
 
-/** Move the cards and re-draw the edges at their current layout positions. */
-function paintPositions() {
-  for (const [id, card] of state.nodeEls) {
-    const point = state.pos.get(id);
-    if (point) {
+/** The part of the world the stage is showing, in world units, grown by one
+ * card so a card is materialised just before it scrolls into view. */
+function visibleRect() {
+  const { x, y, k } = state.transform;
+  const { width, height } = state.viewport;
+  return {
+    x0: -x / k - CARD_W,
+    y0: -y / k - CARD_H,
+    x1: (width - x) / k + CARD_W,
+    y1: (height - y) / k + CARD_H,
+  };
+}
+
+/** Bring the DOM in line with the transform, the viewport and the positions.
+ *
+ * Called both when only the view moved (`moved: false`, a pan or a zoom) and
+ * when the nodes themselves moved (`moved: true`, a settle step or a drag).
+ * One loop rather than two, because the decisions are the same either way and
+ * the only difference is whether a card has to be repositioned.
+ *
+ * Two things this must never do. It must not read layout — no `clientWidth`,
+ * no `getBoundingClientRect` — because it runs inside the settle loop, where a
+ * forced reflow per frame is the cost it exists to remove; the viewport is
+ * kept up to date by a ResizeObserver instead. And it must not write a
+ * property that has another owner: class names belong to `select`,
+ * `clearSelection` and `applyFilter`, positions to the layout, and only
+ * `hidden` and `data-lod` belong here. Keeping that boundary is what stops the
+ * cache below from clobbering `.selected`, `.root` or `.dim`.
+ */
+function syncView({ moved = false } = {}) {
+  const { k } = state.transform;
+  const { width, height } = state.viewport;
+  // The contact sheet is showing, or the observer has not fired yet.
+  if (!width || !height) return;
+
+  // While the layout is still moving, everything is a mark. The cards are in
+  // flight, so what is printed on them is the least useful thing on screen,
+  // and it is not free: the seed layout is more compact than the settled one,
+  // so the view starts zoomed further in than it ends. Painting pictures and
+  // links at that intermediate zoom decodes every thumbnail in the crawl and
+  // then throws them away when `fit` pulls back — a few seconds of work, at
+  // exactly the moment the page should be arriving.
+  const lod =
+    !state.settling && k * CARD_W >= FULL_CARD_PX ? "full" : "mark";
+  const rect = visibleRect();
+
+  for (const node of state.nodes) {
+    const card = state.nodeEls.get(node.id);
+    const point = state.pos.get(node.id);
+    if (!card || !point) continue;
+
+    const inside =
+      point.x >= rect.x0 &&
+      point.x <= rect.x1 &&
+      point.y >= rect.y0 &&
+      point.y <= rect.y1;
+    // A card the user is holding, or the one whose links are lit up, stays
+    // drawn wherever it is: dragging a card to the edge of the window must not
+    // make it vanish from under the pointer, and selecting a page off screen
+    // from the instance list must show something.
+    const keep =
+      inside || node.id === state.dragging || node.id === state.highlightId;
+
+    const applied = state.drawn.get(node.id);
+    if (!keep) {
+      if (!applied || !applied.hidden) card.hidden = true;
+      // The card keeps whatever tier it was drawn at. Recording the current
+      // one instead would claim a tier the element never got, and the card
+      // would come back at the wrong level of detail for good.
+      state.drawn.set(node.id, { hidden: true, lod: applied ? applied.lod : null });
+      continue;
+    }
+
+    // Position before un-hiding, so a card that was culled at its old spot
+    // does not appear there for a frame.
+    if (moved || !applied || applied.hidden) {
       card.style.transform = `translate(${point.x}px, ${point.y}px)`;
     }
+    if (!applied || applied.hidden) card.hidden = false;
+    if (!applied || applied.lod !== lod) card.dataset.lod = lod;
+    state.drawn.set(node.id, { hidden: false, lod });
   }
-  for (const edge of state.edgeEls) {
-    const source = state.pos.get(edge.source);
-    const target = state.pos.get(edge.target);
-    if (!source || !target) continue;
-    drawEdge(edge.el, source, target);
+
+  paintEdges(lod, rect);
+}
+
+/** Move the cards to their current layout positions. */
+function paintPositions() {
+  syncView({ moved: true });
+}
+
+/** A fresh edge element. Built with `createElementNS` and `setAttribute`
+ * rather than `el()`: an SVG element's `className` is read-only, and `el()`
+ * assigns to it. */
+function newEdgeLine() {
+  const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
+  $("edges").append(line); // `append`, never `replaceChildren` — the arrow
+  return line; //             markers are a <defs> in the same layer
+}
+
+/** The one owner of how an edge looks: its class and its arrowhead.
+ *
+ * Called both when the selection changes and by the pool when it fills, so an
+ * edge that comes into view while something is selected arrives already
+ * coloured rather than grey among its lit neighbours.
+ */
+function applyEdgeStyle(line, source, target) {
+  const id = state.highlightId;
+  const out = id !== null && source === id;
+  const into = id !== null && target === id;
+  const only = out !== into; // a self-link would be both; there are none
+  const classes = ["edge"];
+  if (only) classes.push(out ? "out" : "in");
+  else if (id !== null) classes.push("faded");
+  line.setAttribute("class", classes.join(" "));
+  line.setAttribute(
+    "marker-end",
+    `url(#${only ? (out ? "arrow-out" : "arrow-in") : "arrow"})`
+  );
+}
+
+/** Draw the edges that join two cards on screen, and no others.
+ *
+ * Below `full` this draws nothing at all: an arrow only says something when
+ * you can see both of the cards it joins, and a few thousand lines across a
+ * field of marks is a grey haze that costs more to paint than the marks do.
+ *
+ * The pool is grown, never rebuilt, and only ever appended to. Slots past the
+ * used prefix keep their geometry but lose their class and are hidden, so
+ * `line.edge` still counts exactly the edges being drawn — which is what the
+ * tests count.
+ */
+function paintEdges(lod, rect) {
+  const pool = state.edgePool;
+  const refs = state.edgeRefs;
+  const onScreen = (point) =>
+    point.x >= rect.x0 &&
+    point.x <= rect.x1 &&
+    point.y >= rect.y0 &&
+    point.y <= rect.y1;
+
+  let used = 0;
+  if (lod === "full") {
+    // A scan of every edge, per pass. At a few thousand routes that is well
+    // under a millisecond, and the alternative — an index of which nodes are
+    // drawn, kept in step with the pass above — is a second thing to keep
+    // correct for no gain at the size this is built for.
+    for (const edge of state.edges) {
+      const source = state.pos.get(edge.source);
+      const target = state.pos.get(edge.target);
+      if (!source || !target) continue;
+      if (!onScreen(source) || !onScreen(target)) continue;
+      const line = pool[used] || (pool[used] = newEdgeLine());
+      // Every activated slot, not just the new ones: a reused slot still holds
+      // the last edge's geometry, and would otherwise flash a line across the
+      // screen for a frame.
+      drawEdge(line, source, target);
+      applyEdgeStyle(line, edge.source, edge.target);
+      line.hidden = false;
+      refs[used] = edge;
+      used++;
+    }
   }
+
+  for (let index = used; index < state.edgeUsed; index++) {
+    pool[index].hidden = true;
+    pool[index].removeAttribute("class");
+  }
+  state.edgeUsed = used;
 }
 
 /** Draw an edge between card centres, trimmed back to each card's border. */
@@ -579,6 +930,12 @@ function drawEdge(line, source, target) {
   line.setAttribute("y2", source.y + uy * end);
 }
 
+/** Build the contact sheet.
+ *
+ * On first open rather than at load: a tile is a button with a thumbnail and
+ * two lines of text, and a few thousand of them is work no one asked for while
+ * the graph tab is showing. `setView` calls this.
+ */
 function renderSheet() {
   const grid = $("grid");
   grid.replaceChildren();
@@ -606,6 +963,11 @@ function renderSheet() {
     tile.addEventListener("click", () => select(node.id, { center: true }));
     grid.append(tile);
   }
+
+  // Both of these may already be set — the sheet is built on first open, which
+  // can be long after a filter was typed or a page selected.
+  paintSelection();
+  applyFilter();
 }
 
 /* ------------------------------------------------------- pan / zoom / fit */
@@ -628,6 +990,10 @@ function capturePointer(element, pointerId) {
 function applyTransform() {
   const { x, y, k } = state.transform;
   $("world").style.transform = `translate(${x}px, ${y}px) scale(${k})`;
+  // Synchronously, not on a frame: it is O(n) comparisons with a change check,
+  // and a view that lags the transform by a frame is a view that shows cards
+  // where they no longer are.
+  syncView();
 }
 
 function viewportSize() {
@@ -695,44 +1061,46 @@ function centreOn(id) {
 function select(id, options = {}) {
   if (!state.byId.has(id)) return;
   state.selected = id;
-
+  paintSelection();
   // A folded instance selects its route — that is the card on screen — while
   // the inspector still opens the page that was actually asked for.
-  const drawn = routeOf(id);
-  for (const [otherId, card] of state.nodeEls) {
-    card.classList.toggle("selected", otherId === drawn);
+  if (options.center) centreOn(routeOf(id));
+  openInspector(id);
+}
+
+/** Mark the selected route wherever it is drawn: the card in the graph, the
+ * tile in the contact sheet, and the edges joining it.
+ *
+ * One owner, called from `select`, `clearSelection` and `renderSheet` — the
+ * sheet is built on first open now, so a selection made before that has to be
+ * applied to tiles that did not exist when it happened.
+ */
+function paintSelection() {
+  // `state.selected` is the page that was asked for, which may be one instance
+  // of a folded route. What gets drawn — and what lights up — is the route.
+  const drawn = state.selected === null ? null : routeOf(state.selected);
+  state.highlightId = drawn;
+
+  for (const [id, card] of state.nodeEls) {
+    card.classList.toggle("selected", id === drawn);
   }
   for (const tile of document.querySelectorAll(".tile")) {
     tile.classList.toggle("selected", tile.dataset.id === drawn);
   }
-  highlightEdges(drawn);
-  if (options.center) centreOn(drawn);
-  openInspector(id);
-}
 
-/** Colour the selected node's edges by direction; fade everything else. */
-function highlightEdges(id) {
-  for (const edge of state.edgeEls) {
-    const out = id !== null && edge.source === id;
-    const into = id !== null && edge.target === id;
-    const only = out !== into; // a self-link would be both; there are none
-    edge.el.classList.toggle("out", only && out);
-    edge.el.classList.toggle("in", only && into);
-    edge.el.classList.toggle("faded", id !== null && !out && !into);
-    edge.el.setAttribute(
-      "marker-end",
-      `url(#${only ? (out ? "arrow-out" : "arrow-in") : "arrow"})`
-    );
+  const { edgePool, edgeRefs, edgeUsed } = state;
+  for (let index = 0; index < edgeUsed; index++) {
+    applyEdgeStyle(edgePool[index], edgeRefs[index].source, edgeRefs[index].target);
   }
+
+  // The selected card is never culled, so a selection made off screen has to
+  // be drawn before it can be seen.
+  syncView();
 }
 
 function clearSelection() {
   state.selected = null;
-  for (const card of state.nodeEls.values()) card.classList.remove("selected");
-  for (const tile of document.querySelectorAll(".tile")) {
-    tile.classList.remove("selected");
-  }
-  highlightEdges(null);
+  paintSelection();
   $("inspector").hidden = true;
   document.body.classList.remove("inspecting");
 }
@@ -1005,6 +1373,12 @@ function setView(name) {
     tab.classList.toggle("is-active", active);
     tab.setAttribute("aria-selected", String(active));
   }
+  // After the tab has been switched, so the click lands before the sheet is
+  // built; and before `fit`, which has nothing to do with the graph tab.
+  if (name === "sheet" && !state.sheetBuilt) {
+    state.sheetBuilt = true;
+    renderSheet();
+  }
   if (name === "graph") fit();
 }
 
@@ -1026,6 +1400,19 @@ function wireEvents() {
   });
 
   const stage = $("stage");
+
+  // The stage's size as the culler sees it, kept without measuring it: reading
+  // clientWidth in the pass would force a reflow on every frame of the settle
+  // loop, and would read 0x0 while the contact sheet is showing — from which
+  // every card would be culled. The observer also catches the 380px the
+  // inspector takes when it opens, which fires no window resize event.
+  state.viewport = viewportSize();
+  new ResizeObserver((entries) => {
+    const { width, height } = entries[entries.length - 1].contentRect;
+    if (!width || !height) return; // hidden behind the other tab
+    state.viewport = { width, height };
+    syncView();
+  }).observe(stage);
 
   stage.addEventListener("pointerdown", (event) => {
     if (event.target.closest(".node")) return;
@@ -1074,6 +1461,9 @@ function wireEvents() {
     const start = { x: event.clientX, y: event.clientY, px: point.x, py: point.y };
     let moved = false;
     capturePointer(card, event.pointerId);
+    // Held: a card dragged to the edge of the window stays drawn, rather than
+    // being culled out from under the pointer that is dragging it.
+    state.dragging = id;
 
     const move = (moveEvent) => {
       const k = state.transform.k;
@@ -1089,6 +1479,7 @@ function wireEvents() {
       card.removeEventListener("pointermove", move);
       card.removeEventListener("pointerup", up);
       card.removeEventListener("pointercancel", up);
+      state.dragging = null;
       if (!moved) select(id, { center: false });
     };
     card.addEventListener("pointermove", move);

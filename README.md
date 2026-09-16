@@ -100,6 +100,12 @@ Two views share one dataset:
 - **Contact sheet** — every page as a grid of thumbnails, for scanning a site
   at a glance.
 
+Zoomed out, a big site is drawn as small marks rather than cards: a few hundred
+cards at that size would be a smear, and drawing every screenshot and every
+link to make it is slow. Zoom in and the cards, their pictures and the arrows
+between them come back. Nothing is hidden — every page keeps its own mark, and
+the contact sheet is unchanged.
+
 ![The contact sheet view](docs/contact-sheet.png)
 
 The inspector shows a page's screenshot, status, depth and ID, and lists its

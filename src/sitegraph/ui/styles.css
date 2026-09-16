@@ -17,7 +17,13 @@
   --ok: #58d68d;
   --radius: 10px;
   --inspector-w: 380px;
+  /* A card's box, and only ever one of them: the same pair of numbers decides
+     what the culler measures, what the edge trim stops short of, what the
+     layout keeps apart, and how big the card is on screen. app.js spells the
+     same values as CARD_W/CARD_H; `--card-h` is not the sum of its parts by
+     accident — .thumb (105) plus .meta (46) plus the two 1px borders. */
   --card-w: 168px;
+  --card-h: 153px;
 }
 
 * {
@@ -195,6 +201,7 @@ body.inspecting main {
 .node {
   position: absolute;
   width: var(--card-w);
+  height: var(--card-h);
   background: var(--panel);
   border: 1px solid var(--line);
   border-radius: var(--radius);
@@ -233,6 +240,56 @@ body.inspecting main {
   padding: 1px 7px;
   font-size: 10px;
   letter-spacing: 0.3px;
+}
+
+/* ---------- level of detail ----------
+
+   A card too small on screen to show a picture is drawn as a plain mark
+   instead: no thumbnail, no text, no shadow. app.js sets data-lod from the
+   card's on-screen width, and it is the only thing that decides this.
+
+   These rules sit after the `.node.*` state rules above on purpose -- they
+   have to win a specificity tie against `.node.selected`.
+
+   The box itself never changes -- .thumb keeps its height and .meta keeps its
+   place, they are just not painted -- so the culler, the edge trim, the fit
+   padding and the layout's separation all keep measuring the same card. */
+
+.node[data-lod="mark"] {
+  background: var(--panel-2);
+  box-shadow: none;
+}
+
+.node[data-lod="mark"] .thumb {
+  background: none;
+  border-bottom: 0;
+}
+
+.node[data-lod="mark"] .thumb img,
+.node[data-lod="mark"] .meta {
+  display: none;
+}
+
+/* At this size a badge is unreadable and a 1px border is a tenth of a pixel,
+   so identity is carried by the fill, which survives being drawn three pixels
+   across. A failed page has to stay tellable apart from the two hundred marks
+   around it: that it still appears in the graph is an invariant (spec §7), not
+   a detail of how the card is drawn. Last, so failure wins over root or
+   selection. */
+.node[data-lod="mark"].root {
+  background: var(--accent);
+}
+
+.node[data-lod="mark"].selected {
+  background: var(--text);
+}
+
+.node[data-lod="mark"].failed {
+  background: var(--bad);
+}
+
+.node[data-lod="mark"] .thumb::after {
+  display: none;
 }
 
 .thumb {
