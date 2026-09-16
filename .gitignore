@@ -27,3 +27,4 @@ claude_env.sh
 /.sitegraph-sentinel/
 /.sitegraph-python-docs/
 /.sitegraph-python-docs-partial/
+/.mcp.json
